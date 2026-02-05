@@ -63,7 +63,7 @@ public class WebsocketTranscriptionsExample {
     @Override
     public void onTranscriptionsMessageUpdate(
         WebsocketsAudioTranscriptionsClient client, TranscriptionsMessageUpdateEvent event) {
-      System.out.println(event.getData().getContent());
+      System.out.println("实时转录结果: " + event.getData().getContent());
     }
 
     // 转录消息完成事件 (transcriptions.message.completed)
