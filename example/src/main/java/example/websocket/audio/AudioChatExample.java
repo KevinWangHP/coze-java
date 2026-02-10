@@ -1,11 +1,15 @@
 package example.websocket.audio;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -48,7 +52,7 @@ public class AudioChatExample {
   private static final int SAMPLE_SIZE_IN_BITS = 16;
   private static final boolean BIG_ENDIAN = false;
   private static final int SILENCE_THRESHOLD = 1000; // 静音阈值
-  private static final int SILENCE_DURATION = 2000; // 静音持续时间（毫秒）
+  private static final int SILENCE_DURATION = 5000; // 静音持续时间（毫秒）修改为5秒
 
   // 解决Java Sound API的命名冲突
   private static final javax.sound.sampled.AudioFormat JAVA_AUDIO_FORMAT =
@@ -66,10 +70,12 @@ public class AudioChatExample {
   private static List<String> transcriptionSegments = new ArrayList<>();
   private static long lastSoundTime = System.currentTimeMillis();
   private static long lastTranscriptUpdateTime = System.currentTimeMillis();
+  private static final long TRANSCRIPTION_TIMEOUT = 2000; // 3秒无更新超时
   
   // 对话历史管理
   private static List<Message> messageHistory = new ArrayList<>();
   private static String conversationId = null;
+  private static String currentChatId = null;
   
   // 音频播放队列管理
   private static ExecutorService audioPlaybackExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -77,26 +83,64 @@ public class AudioChatExample {
     t.setDaemon(true);
     return t;
   });
+  private static Future<?> currentAudioFuture = null;
 
   // 调用bot并处理响应（对应前端的callBot函数）
   private static void callBotAndProcessResponse(CozeAPI coze, String botID, String userID, String transcription, String voiceID, WebsocketsAudioTranscriptionsClient transcriptionClient) throws Exception {
-    System.out.println("=== Calling Bot ===");
-    
+    System.out.println("=== Calling Bot ====");
+   
     // 中断当前音频播放
     interruptAudioPlayback();
     
-    // 添加用户消息到对话历史
-    Message userMessage = Message.buildUserQuestionText(transcription);
-    messageHistory.add(userMessage);
+    // 检查并处理最后一条消息如果是用户消息
+    if (!messageHistory.isEmpty()) {
+        Message lastMsg = messageHistory.get(messageHistory.size() - 1);
+        if (lastMsg.getRole().getValue().equals("user")) {
+            // 删除最后一条用户消息
+            messageHistory.remove(messageHistory.size() - 1);
+            System.out.println("[HISTORY] Removed duplicate user message");
+        }
+    }
     
-    System.out.println("User message: " + transcription);
+    // 添加最新的用户消息到历史
+    Message newUserMessage = Message.buildUserQuestionText(transcription);
+    messageHistory.add(newUserMessage);
+    System.out.println("[HISTORY] Added new user message: " + transcription);
     
-    // 构造聊天请求
+    // 构造完整对话历史JSON字符串
+    StringBuilder historyJson = new StringBuilder();
+    historyJson.append("[");
+    
+    // 添加所有历史消息
+    for (int i = 0; i < messageHistory.size(); i++) {
+        Message msg = messageHistory.get(i);
+        if (i > 0) {
+            historyJson.append(",");
+        }
+        historyJson.append(String.format(
+            "{\"role\":\"%s\",\"content\":\"%s\"}",
+            msg.getRole().getValue(),
+            msg.getContent().replace("\"", "\\\"").replace("\n", "\\n")
+        ));
+    }
+    
+    historyJson.append("]");
+    
+    String fullHistoryJson = historyJson.toString();
+    System.out.println("Full conversation history JSON: " + fullHistoryJson);
+    
+    // 创建包含JSON历史的用户消息
+    Message userMessage = Message.buildUserQuestionText(fullHistoryJson);
+
+    
+    System.out.println("User message with history: " + fullHistoryJson);
+    
+    // 构造聊天请求 - 发送包含完整历史的JSON
     CreateChatReq chatReq =
         CreateChatReq.builder()
             .botID(botID)
             .userID(userID)
-            .messages(Collections.singletonList(userMessage))
+            .messages(Collections.singletonList(userMessage)) // 只发送包含历史的单条消息
             .build();
 
     Flowable<ChatEvent> chatResp = coze.chat().stream(chatReq);
@@ -107,9 +151,129 @@ public class AudioChatExample {
         .subscribeOn(Schedulers.io())
         .subscribe(
             event -> {
-              if (ChatEventType.CONVERSATION_MESSAGE_DELTA.equals(event.getEvent())) {
+              // Log all events for debugging
+              String eventValue = event.getEvent().getValue();
+              System.out.println("[CHAT EVENT] Received event: " + eventValue);
+
+              if (ChatEventType.CONVERSATION_CHAT_CREATED.getValue().equals(eventValue)) {
+                if (event.getLogID() != null) {
+                  String oldChatId = currentChatId;
+                  currentChatId = event.getLogID();
+                  System.out.println("[CHAT] Updated currentChatId: " + oldChatId + " -> " + currentChatId);
+                }
+              } else if (ChatEventType.CONVERSATION_MESSAGE_DELTA.getValue().equals(eventValue)) {
                 if (event.getMessage() != null && event.getMessage().getContent() != null) {
                   botResponse.append(event.getMessage().getContent());
+                }
+              } else if (ChatEventType.CONVERSATION_CHAT_COMPLETED.getValue().equals(eventValue)) {
+                if (event.getLogID() != null) {
+                  String completedChatId = event.getLogID();
+                  if (completedChatId.equals(currentChatId)) {
+                                        System.out.println("[CHAT] Completed chat ID matches current: " + completedChatId);
+                    // 发送清除音频缓冲区事件
+                    System.out.println("[ASYNC] 发送清除音频缓冲区事件...");
+                    transcriptionClient.inputAudioBufferClear();
+                    // 等待清除完成
+                    TimeUnit.MILLISECONDS.sleep(1000);
+                    // Proceed with speech synthesis
+                    System.out.println("\nBot response: " + botResponse.toString());
+                    
+                    // 添加AI回复到对话历史
+                    Message aiMessage = Message.buildAssistantAnswer(botResponse.toString());
+                    messageHistory.add(aiMessage);
+                    
+                    final String responseText = botResponse.toString();
+                    // 中断所有正在进行的音频操作
+
+                    
+                    // 取消之前的音频播放任务
+                    if (currentAudioFuture != null && !currentAudioFuture.isDone()) {
+                        interruptAudioPlayback();
+                        try {
+                            currentAudioFuture.cancel(true);
+                            System.out.println("[AUDIO] Cancelled previous audio playback task");
+                        } catch (Exception e) {
+                            System.err.println("[AUDIO] Error cancelling previous task: " + e.getMessage());
+                        }
+                    }
+                    
+                    // 异步处理TTS和播放，不阻塞录制线程
+                    currentAudioFuture = audioPlaybackExecutor.submit(() -> {
+                        try {
+                          isResponding.set(true);
+                          
+                          // 确保停止所有正在播放的音频
+                          interruptAudioPlayback();
+                          
+                          // 发送清除音频缓冲区事件
+                          System.out.println("[ASYNC] 发送清除音频缓冲区事件...");
+                          transcriptionClient.inputAudioBufferClear();
+                          
+                          // 等待清除完成
+                          TimeUnit.MILLISECONDS.sleep(1000);
+                          
+                          // 解析语气和内容
+                          String tone = "";
+                          String content = responseText;
+                          
+                          // 匹配[语气] 内容格式
+                          java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\\[(.*?)\\]");
+                          java.util.regex.Matcher matcher = pattern.matcher(responseText);
+                          
+                          if (matcher.find()) {
+                            tone = matcher.group(1);
+                            content = matcher.replaceFirst("").trim();
+                            System.out.println("[speech] tone: " + tone + " content: " + content);
+                          }
+                          
+                          // 如果有语气参数，更新语音合成配置
+                          if (!tone.isEmpty()) {
+                            try {
+                              // 这里需要实现speech.update发送逻辑
+                              // 参考前端实现：发送speech.update事件更新合成配置
+                              System.out.println("[speech] updated with tone: " + tone);
+                            } catch (Exception e) {
+                              System.err.println("[speech] update error: " + e.getMessage());
+                            }
+                          }
+                          
+                          // 创建语音合成请求
+                          CreateSpeechReq speechReq =
+                              CreateSpeechReq.builder()
+                                  .input(content)
+                                  .voiceID(voiceID)
+                                  .responseFormat(com.coze.openapi.client.audio.common.AudioFormat.WAV)
+                                  .sampleRate(24000)
+                                  .build();
+
+                          System.out.println("[ASYNC] 开始生成语音...");
+                          CreateSpeechResp speechResp = coze.audio().speech().create(speechReq);
+                          byte[] speechBytes = speechResp.getResponse().bytes();
+                          
+                          System.out.println("[ASYNC] 开始播放语音...");
+                          visualizeAudio(speechBytes); // 使用未使用的可视化方法
+                          playAudio(speechBytes, 24000, 16, 1, true, false);
+                      
+                          System.out.println("[ASYNC] 语音播放完成");
+                          
+                        } catch (InterruptedException e) {
+                          System.out.println("[ASYNC] Audio playback task was interrupted");
+                          Thread.currentThread().interrupt();
+                        } catch (Exception e) {
+                          System.err.println("[ASYNC] 音频播放错误: " + e.getMessage());
+                          // 不打印完整栈跟踪以避免混乱
+                        } finally {
+                          isResponding.set(false);
+                        }
+                      });
+                    
+                    System.out.println("[MAIN] 继续录制，不等待语音播放完成");
+                  } else {
+                    System.out.println("[CHAT] Completed chat ID does not match current. Skipping speech synthesis.");
+                    System.out.println("[CHAT] Current: " + currentChatId + " Completed: " + completedChatId);
+                    // Skip speech synthesis for this completed chat
+                  }
+                  // Reset currentChatId after processing completed event
                 }
               }
             },
@@ -117,55 +281,10 @@ public class AudioChatExample {
               System.err.println("Chat error: " + throwable.getMessage());
               throwable.printStackTrace();
               isResponding.set(false);
+              // Reset currentChatId on error
             },
             () -> {
-              System.out.println("\nBot response: " + botResponse.toString());
-              
-              // 添加AI回复到对话历史
-              Message aiMessage = Message.buildAssistantAnswer(botResponse.toString());
-              messageHistory.add(aiMessage);
-              
-              final String responseText = botResponse.toString();
-              
-              // 异步处理TTS和播放，不阻塞录制线程
-              audioPlaybackExecutor.submit(() -> {
-                try {
-                  isResponding.set(true);
-                  
-                  CreateSpeechReq speechReq =
-                      CreateSpeechReq.builder()
-                          .input(responseText)
-                          .voiceID(voiceID)
-                          .responseFormat(com.coze.openapi.client.audio.common.AudioFormat.WAV)
-                          .sampleRate(24000)
-                          .build();
-
-                  System.out.println("[ASYNC] 开始生成语音...");
-                  CreateSpeechResp speechResp = coze.audio().speech().create(speechReq);
-                  byte[] speechBytes = speechResp.getResponse().bytes();
-                  
-                  System.out.println("[ASYNC] 开始播放语音...");
-              visualizeAudio(speechBytes); // 使用未使用的可视化方法
-              playAudio(speechBytes, 24000, 16, 1, true, false);
-              
-              System.out.println("[ASYNC] 语音播放完成");
-                  
-                  // 发送清除音频缓冲区事件
-                  System.out.println("[ASYNC] 发送清除音频缓冲区事件...");
-                  transcriptionClient.inputAudioBufferClear();
-                  
-                  // 等待清除完成
-                  TimeUnit.MILLISECONDS.sleep(1000);
-                  
-                } catch (Exception e) {
-                  System.err.println("[ASYNC] 音频播放错误: " + e.getMessage());
-                  e.printStackTrace();
-                } finally {
-                  isResponding.set(false);
-                }
-              });
-              
-              System.out.println("[MAIN] 继续录制，不等待语音播放完成");
+              // Empty onComplete handler - all processing is done in event handler
               isResponding.set(false);
             });
     
@@ -211,11 +330,8 @@ public class AudioChatExample {
   }
 
   // 创建会话（对应前端的createConversation函数）
-  private static void createConversation(CozeAPI coze, String botID) throws Exception {
+  private static void createConversation(CozeAPI coze, String botID, String userID) throws Exception {
       System.out.println("=== Creating conversation ===");
-      
-      // 生成固定的user_id，用于标识当前用户
-      String userId = "whp";
       
       // 使用Java客户端API创建会话
       CreateConversationReq req = new CreateConversationReq();
@@ -226,7 +342,7 @@ public class AudioChatExample {
       
       System.out.println("[CONVERSATION] Created conversation ID: " + conversationId);
       System.out.println("[CONVERSATION] Bot ID: " + botID);
-      System.out.println("[CONVERSATION] User ID: " + userId);
+      System.out.println("[CONVERSATION] User ID: " + userID);
   }
 
   // 检查转录是否完成（通过检查是否有新的转录结果）
@@ -237,25 +353,44 @@ public class AudioChatExample {
 
   // 音频播放方法（支持队列管理）
   private static void playAudio(byte[] audioData, int sampleRate, int sampleSizeInBits, int channels, boolean signed, boolean bigEndian) throws Exception {
+    // 实现音频播放逻辑
+    System.out.println("[AUDIO] 开始播放音频");
+    
+    // 使用Java Sound API播放音频
     javax.sound.sampled.AudioFormat audioFormat = new javax.sound.sampled.AudioFormat(
         sampleRate, sampleSizeInBits, channels, signed, bigEndian);
     
     DataLine.Info info = new DataLine.Info(SourceDataLine.class, audioFormat);
-    SourceDataLine sourceDataLine = (SourceDataLine) AudioSystem.getLine(info);
-    sourceDataLine.open(audioFormat);
-    sourceDataLine.start();
+    audioLine = (SourceDataLine) AudioSystem.getLine(info);
+    audioLine.open(audioFormat);
+    audioLine.start();
     
-    // 播放音频（对应前端的AudioContext和decodeAudioData）
-    sourceDataLine.write(audioData, 0, audioData.length);
-    sourceDataLine.drain();
-    sourceDataLine.stop();
-    sourceDataLine.close();
+    audioLine.write(audioData, 0, audioData.length);
+    audioLine.drain();
+    audioLine.close();
+    audioLine = null;
   }
 
   // 中断当前音频播放（对应前端的interrupt）
+  private static SourceDataLine audioLine = null;
+  
   private static void interruptAudioPlayback() {
-    // 这里可以添加中断逻辑
-    System.out.println("[AUDIO] 中断当前音频播放");
+    if (audioLine != null) {
+      try {
+        if (audioLine.isRunning()) {
+          audioLine.stop();
+        }
+        if (audioLine.isOpen()) {
+          audioLine.flush();
+          audioLine.close();
+        }
+        audioLine = null;
+        System.out.println("[AUDIO] 中断当前音频播放");
+      } catch (Exception e) {
+        System.err.println("[AUDIO] 中断音频播放时出错: " + e.getMessage());
+        audioLine = null;
+      }
+    }
   }
 
   // 音频可视化功能（简化版，对应前端的AnalyserNode）
@@ -310,6 +445,9 @@ public class AudioChatExample {
     @Override
     public void onTranscriptionsMessageUpdate(
         WebsocketsAudioTranscriptionsClient client, TranscriptionsMessageUpdateEvent event) {
+      // 中断当前音频播放
+      interruptAudioPlayback();
+      
       String text = event.getData().getContent();
       currentTranscription.set(text);
       lastTranscriptUpdateTime = System.currentTimeMillis();
@@ -387,7 +525,7 @@ public class AudioChatExample {
             .build();
 
     // 创建会话
-    createConversation(coze, botID);
+    createConversation(coze, botID, userID);
 
     // Step 1: Get audio devices and select microphone
     System.out.println("Getting audio devices...");
@@ -426,17 +564,18 @@ public class AudioChatExample {
         microphone = (TargetDataLine) AudioSystem.getLine(info);
     }
     
-    microphone.open(JAVA_AUDIO_FORMAT);
-    microphone.start();
-
     // 检查麦克风是否可用
-    if (microphone == null || !microphone.isOpen()) {
+    if (microphone == null) {
         System.out.println("[ERROR] 麦克风无法打开");
         return;
     }
     
+    // 打开麦克风
+    microphone.open(JAVA_AUDIO_FORMAT);
+    microphone.start();
+    
     // 等待麦克风初始化
-    TimeUnit.MILLISECONDS.sleep(1000); // 更长的初始化时间
+    TimeUnit.MILLISECONDS.sleep(1000); // 缩短初始化时间
     System.out.println("[DEBUG] 麦克风初始化完成，开始录制...");
     System.out.println("[DEBUG] 音频格式: " + JAVA_AUDIO_FORMAT);
 
@@ -487,83 +626,43 @@ public class AudioChatExample {
     System.out.println("[DEBUG] 转录配置已发送: " + SAMPLE_RATE + "采样率, PCM格式");
     System.out.println("[DEBUG] 转录配置已发送: " + inputAudio);
 
-    // Start streaming audio
+    // 实时流式输入
     byte[] audioBuffer = new byte[1024];
     int bytesRead;
-
-    long lastUpdateTime = System.currentTimeMillis();
     lastSoundTime = System.currentTimeMillis(); // 初始化最后有声音的时间
-    boolean isProcessing = false;
-
+    
+    System.out.println("开始实时录音和流式传输...");
+    
     while (isTranscribing.get()) {
       bytesRead = microphone.read(audioBuffer, 0, audioBuffer.length);
       if (bytesRead > 0) {
-        transcriptionClient.inputAudioBufferAppend(Arrays.copyOf(audioBuffer, bytesRead));
-        TimeUnit.MILLISECONDS.sleep(100);
-        // 检测是否有声音
-        boolean hasSound = false;
-        for (int i = 0; i < bytesRead; i += 2) { // 16位采样，每2字节一个样本
-          short sample = (short) ((audioBuffer[i] & 0xFF) | (audioBuffer[i + 1] << 8));
-          if (Math.abs(sample) > SILENCE_THRESHOLD) {
-            hasSound = true;
-            lastSoundTime = System.currentTimeMillis(); // 更新最后有声音的时间
-            break;
-          }
-        }
-        if (hasSound) {
-            System.out.println("[AUDIO DETECTED] 检测到音频输入，发送 " + bytesRead + " 字节");
-        } else {
-            // System.out.println("[AUDIO SILENT] 检测到静音输入，发送 " + bytesRead + " 字节");
-        }
-
-
-        // 检测静音持续时间
-      if (System.currentTimeMillis() - lastSoundTime > SILENCE_DURATION && !isProcessing) {
-        isProcessing = true;
-        
-        String fullTranscription = String.join(" ", transcriptionSegments);
-        
-        if (!fullTranscription.isEmpty()) {
-            // 将整个bot调用放入异步线程，主循环继续录制
-            audioPlaybackExecutor.submit(() -> {
-              try {
-                callBotAndProcessResponse(coze, botID, userID, fullTranscription, voiceID, transcriptionClient);
-              } catch (Exception e) {
-                System.err.println("[ASYNC] 调用bot失败: " + e.getMessage());
-                e.printStackTrace();
+          // 直接发送音频数据
+          transcriptionClient.inputAudioBufferAppend(Arrays.copyOf(audioBuffer, bytesRead));
+          
+          // 不再检测声音，改为在transcription update事件中处理音频停止
+          
+          // 检测转录更新超时
+          if (System.currentTimeMillis() - lastTranscriptUpdateTime > TRANSCRIPTION_TIMEOUT) {
+              // 检查本地缓存是否为空
+              if (!transcriptionSegments.isEmpty()) {
+                  // 取list的最后一个值作为user message
+                  String lastTranscription = transcriptionSegments.get(transcriptionSegments.size() - 1);
+                  System.out.println("[TRANSCRIPTION TIMEOUT] 3秒无转录更新，清除缓冲区并处理结果");
+                  // transcriptionClient.inputAudioBufferClear();
+                  
+                  // 调用bot处理
+                  callBotAndProcessResponse(coze, botID, "default_user_id", lastTranscription, voiceID, transcriptionClient);
+                  // 清空转录片段
+                  transcriptionSegments.clear();
               }
-            });
-            
-            // 清空本地缓存
-            transcriptionSegments.clear();
-            currentTranscription.set(null);
-            lastUpdateTime = System.currentTimeMillis();
-            lastTranscriptUpdateTime = System.currentTimeMillis(); // 使用未使用的变量
-        } else {
-            // System.out.println("[WARNING] 转录结果为空");
+          }
+          
+          // 模拟人说话的间隔，避免发送过快
+          TimeUnit.MILLISECONDS.sleep(10);
         }
-        
-        // 继续录制，不需要重启麦克风
-        lastSoundTime = System.currentTimeMillis();
-        isProcessing = false;
-      }
-      }
-
-      // Check if no update for 2 seconds
-      if (currentTranscription.get() != null
-          && isTranscriptionCompleted(lastUpdateTime)) {
-        transcriptionSegments.add(currentTranscription.get());
-        currentTranscription.set(null);
-        System.out.println("[DEBUG] 2秒无新识别结果，结束当前输入");
-        break;
-      }
-      if (currentTranscription.get() != null) {
-        lastUpdateTime = System.currentTimeMillis();
-      }
-      // 模拟人说话的间隔，避免发送过快
     }
 
-    // Keep the program running to maintain websocket connection
+    // 保持程序运行以维持WebSocket连接
     System.out.println("[DEBUG] 保持WebSocket连接，持续监听转录事件...");
     while (true) {
         TimeUnit.MILLISECONDS.sleep(1000);
