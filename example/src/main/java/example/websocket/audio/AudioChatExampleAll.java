@@ -20,9 +20,8 @@ import javax.sound.sampled.DataLine;
 import javax.sound.sampled.SourceDataLine;
 import javax.sound.sampled.TargetDataLine;
 
+import com.alibaba.dashscope.audio.omni.*;
 import com.alibaba.dashscope.audio.qwen_tts_realtime.*;
-import com.alibaba.fastjson.JSON;
-import com.alibaba.fastjson.JSONObject;
 import com.coze.openapi.client.audio.common.AudioFormat;
 import com.coze.openapi.client.audio.speech.CreateSpeechReq;
 import com.coze.openapi.client.audio.speech.CreateSpeechResp;
@@ -43,12 +42,6 @@ import com.google.gson.JsonObject;
 
 import io.reactivex.Flowable;
 import io.reactivex.schedulers.Schedulers;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-import okhttp3.WebSocket;
-import okhttp3.WebSocketListener;
-import okio.ByteString;
 
 /*
 This example demonstrates how to:
@@ -59,7 +52,7 @@ This example demonstrates how to:
 */
 public class AudioChatExampleAll {
 
-  private static final int SAMPLE_RATE = 24000; 
+  private static final int SAMPLE_RATE = 24000;
   private static final int CHANNELS = 1;
   private static final int SAMPLE_SIZE_IN_BITS = 16;
   private static final boolean BIG_ENDIAN = false;
@@ -80,17 +73,23 @@ public class AudioChatExampleAll {
   private static List<String> transcriptionSegments = new ArrayList<>();
   private static long lastSoundTime = System.currentTimeMillis();
   private static long lastTranscriptUpdateTime = System.currentTimeMillis();
-  private static final long TRANSCRIPTION_TIMEOUT = 3000; // 2秒无更新超时
+  private static final long TRANSCRIPTION_TIMEOUT = 3000; // 3秒无有效音频输入超时
+  private static AtomicBoolean waitingForCompleted = new AtomicBoolean(false); // 标记是否已发送endSession，等待completed事件
+  private static long lastStatusLogTime = System.currentTimeMillis(); // 上次状态日志时间
 
   // 语音服务选择变量
-  private static final String SPEECH_SERVICE = System.getenv("SPEECH_SERVICE") != null ? System.getenv("SPEECH_SERVICE") : "COZE";
+  private static final String SPEECH_SERVICE =
+      System.getenv("SPEECH_SERVICE") != null ? System.getenv("SPEECH_SERVICE") : "COZE";
 
   // 百炼API相关变量
-  private static WebSocket webSocket = null;
-  private static String taskId = UUID.randomUUID().toString();
   private static final String DASHSCOPE_API_KEY = System.getenv("DASHSCOPE_API_KEY");
-  private static final String WEBSOCKET_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
-  private static final String QWEN_VOICE_ID = System.getenv("QWEN_VOICE_ID") != null ? System.getenv("QWEN_VOICE_ID") : "Cherry";
+  private static final String QWEN_VOICE_ID =
+      System.getenv("QWEN_VOICE_ID") != null ? System.getenv("QWEN_VOICE_ID") : "Cherry";
+
+  // Qwen ASR相关变量
+  private static OmniRealtimeConversation qwenAsrConversation = null;
+  private static AtomicBoolean qwenAsrSessionStarted = new AtomicBoolean(false);
+  private static final boolean QWEN_ASR_VAD_MODE = true; // true=VAD模式(默认), false=手动提交模式
 
   // Coze API相关变量
   private static CozeAPI coze = null;
@@ -124,7 +123,7 @@ public class AudioChatExampleAll {
             t.setDaemon(true);
             return t;
           });
-  
+
   // 音频播放停止标志
   private static volatile boolean shouldStopPlayback = false;
 
@@ -141,11 +140,11 @@ public class AudioChatExampleAll {
 
     // 创建会话
     createConversation(botID, userID);
-    
+
     // 根据语音服务选择初始化连接
     if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
-      // 初始化百炼语音识别服务
-      startBaichuanSpeechRecognition();
+      // 初始化Qwen语音识别服务
+      initQwenAsrClient();
     } else {
       // 初始化Coze转录客户端
       initCozeTranscriptionClient();
@@ -168,7 +167,8 @@ public class AudioChatExampleAll {
 
     // 手动选择设备
     System.out.print("\n请选择音频设备编号 (1-" + inputDevices.size() + "): ");
-    java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(System.in));
+    java.io.BufferedReader reader =
+        new java.io.BufferedReader(new java.io.InputStreamReader(System.in));
     int selectedIndex = 0;
     try {
       String input = reader.readLine();
@@ -181,15 +181,16 @@ public class AudioChatExampleAll {
       System.out.println("[警告] 输入错误，使用第一个设备");
       selectedIndex = 0;
     }
-    
+
     AudioDevice selectedDevice = inputDevices.get(selectedIndex);
     System.out.println("\n选择的音频设备: " + selectedDevice.getDeviceName());
-    
+
     // 检查设备支持的格式
     System.out.println("[麦克风] 检查设备支持的格式...");
     javax.sound.sampled.Mixer mixer = AudioSystem.getMixer(selectedDevice.getMixerInfo());
-    javax.sound.sampled.Line.Info lineInfo = new DataLine.Info(TargetDataLine.class, JAVA_AUDIO_FORMAT);
-    
+    javax.sound.sampled.Line.Info lineInfo =
+        new DataLine.Info(TargetDataLine.class, JAVA_AUDIO_FORMAT);
+
     if (mixer.isLineSupported(lineInfo)) {
       System.out.println("[麦克风] 设备支持当前格式: " + JAVA_AUDIO_FORMAT);
     } else {
@@ -230,7 +231,7 @@ public class AudioChatExampleAll {
       microphone.open();
       System.out.println("[麦克风] 使用设备默认格式: " + microphone.getFormat());
     }
-    
+
     microphone.start();
 
     // 等待麦克风初始化
@@ -243,9 +244,14 @@ public class AudioChatExampleAll {
         .addShutdownHook(
             new Thread(
                 () -> {
-                  System.out.println("[DEBUG] 程序退出，关闭WebSocket连接...");
-                  if (webSocket != null) {
-                    webSocket.close(1000, "Program exit");
+                  System.out.println("[DEBUG] 程序退出，关闭连接...");
+                  if (qwenAsrConversation != null) {
+                    try {
+                      qwenAsrConversation.endSession();
+                    } catch (Exception e) {
+                      System.err.println("[QWEN ASR] 关闭会话失败: " + e.getMessage());
+                    }
+                    qwenAsrConversation.close();
                   }
 
                   // 关闭音频播放线程池
@@ -273,14 +279,14 @@ public class AudioChatExampleAll {
       bytesRead = microphone.read(audioBuffer, 0, audioBuffer.length);
       if (bytesRead > 0) {
         // System.out.println("[DEBUG] 读取到音频数据: " + bytesRead + " 字节");
-        
+
         // 检测是否有声音（简单的能量检测）
         boolean hasSound = false;
         double sum = 0;
         int count = 0;
         short maxSample = 0;
         for (int i = 0; i < bytesRead; i += 2) {
-          short sample = (short) ((audioBuffer[i] & 0xFF) | (audioBuffer[i+1] << 8));
+          short sample = (short) ((audioBuffer[i] & 0xFF) | (audioBuffer[i + 1] << 8));
           sum += Math.abs(sample);
           count++;
           if (Math.abs(sample) > maxSample) {
@@ -292,7 +298,8 @@ public class AudioChatExampleAll {
         }
         double avgEnergy = count > 0 ? sum / count : 0;
         if (hasSound) {
-          // System.out.println("[AUDIO] 检测到语音输入，平均能量: " + String.format("%.0f", avgEnergy) + ", 最大振幅: " + maxSample);
+          // System.out.println("[AUDIO] 检测到语音输入，平均能量: " + String.format("%.0f", avgEnergy) + ",
+          // 最大振幅: " + maxSample);
           if (isResponding.get()) {
             // 如果检测到声音且正在播放TTS，自动打断
             System.out.println("[AUDIO] 检测到用户说话，自动打断TTS播放");
@@ -302,68 +309,82 @@ public class AudioChatExampleAll {
           }
         }
         // 根据语音服务选择发送音频数据
-    if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
-      // 直接发送音频数据到百炼服务
-      if (webSocket != null && isConnected.get()) {
-        webSocket.send(ByteString.of(Arrays.copyOf(audioBuffer, bytesRead)));
-      } else {
-        System.out.println("[AUDIO] 百炼WebSocket连接未建立，跳过音频发送");
-        System.out.println("[AUDIO] webSocket: " + (webSocket != null ? "已初始化" : "未初始化"));
-        System.out.println("[AUDIO] isConnected: " + isConnected.get());
-      }
-    } else {
-      // 直接发送音频数据到Coze服务
-      if (transcriptionClient != null) {
-        try {
-          transcriptionClient.inputAudioBufferAppend(Arrays.copyOf(audioBuffer, bytesRead));
-        } catch (Exception e) {
-          System.err.println("[COZE ASR] 发送音频数据失败: " + e.getMessage());
-          e.printStackTrace();
-        }
-      } else {
-        System.err.println("[COZE ASR] transcriptionClient 为 null，无法发送音频");
-      }
-    }
-
-        // 检测转录更新超时（2秒无更新）
-        if (System.currentTimeMillis() - lastTranscriptUpdateTime > TRANSCRIPTION_TIMEOUT) {
-          String lastTranscription = null;
-          
-          // 根据语音服务选择获取转录结果
-          if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
-            // 百炼流程：使用 currentTranscription
-            lastTranscription = currentTranscription.get();
-          } else {
-            // Coze流程：使用 transcriptionSegments
-            if (!transcriptionSegments.isEmpty()) {
-              lastTranscription = transcriptionSegments.get(transcriptionSegments.size() - 1);
+        if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
+          // 直接发送音频数据到Qwen ASR服务
+          if (qwenAsrConversation != null && qwenAsrSessionStarted.get()) {
+            String audioBase64 =
+                Base64.getEncoder().encodeToString(Arrays.copyOf(audioBuffer, bytesRead));
+            qwenAsrConversation.appendAudio(audioBase64);
+            // 只有在有声音时才更新最后发送音频的时间
+            if (hasSound) {
+              lastSoundTime = System.currentTimeMillis();
             }
+          } else {
+            System.out.println("[AUDIO] Qwen ASR连接未建立，跳过音频发送");
+            System.out.println(
+                "[AUDIO] qwenAsrConversation: " + (qwenAsrConversation != null ? "已初始化" : "未初始化"));
+            System.out.println("[AUDIO] qwenAsrSessionStarted: " + qwenAsrSessionStarted.get());
+          }
+        } else {
+          // 直接发送音频数据到Coze服务
+          if (transcriptionClient != null) {
+            try {
+              transcriptionClient.inputAudioBufferAppend(Arrays.copyOf(audioBuffer, bytesRead));
+            } catch (Exception e) {
+              System.err.println("[COZE ASR] 发送音频数据失败: " + e.getMessage());
+              e.printStackTrace();
+            }
+          } else {
+            System.err.println("[COZE ASR] transcriptionClient 为 null，无法发送音频");
+          }
+        }
+
+        // Qwen ASR手动提交模式：检测有效音频输入超时（3秒无有效音频输入）
+        long timeSinceLastSound = System.currentTimeMillis() - lastSoundTime;
+        if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)
+            && !QWEN_ASR_VAD_MODE  // 非VAD模式才需要手动commit
+            && !waitingForCompleted.get()
+            && timeSinceLastSound > TRANSCRIPTION_TIMEOUT) {
+
+          System.out.println("[TRANSCRIPTION] 3秒无有效音频输入（距离上次有效音频" + timeSinceLastSound + "ms），发送commit");
+
+          // 发送commit，等待completed事件返回结果
+          if (qwenAsrConversation != null && qwenAsrSessionStarted.get()) {
+            try {
+              // 提交音频缓冲区（发送input_audio_buffer.commit）
+              qwenAsrConversation.commit();
+              waitingForCompleted.set(true);
+              System.out.println("[QWEN ASR] 已发送commit，等待completed事件");
+            } catch (Exception e) {
+              System.err.println("[QWEN ASR] 发送commit失败: " + e.getMessage());
+              waitingForCompleted.set(false);
+              lastSoundTime = System.currentTimeMillis();
+            }
+          } else {
+            // 会话未启动，重置计时器
+            lastSoundTime = System.currentTimeMillis();
+          }
+        }
+        
+        // Coze模式的超时处理（保持不变）
+        if (!"QWEN".equalsIgnoreCase(SPEECH_SERVICE) 
+            && System.currentTimeMillis() - lastTranscriptUpdateTime > TRANSCRIPTION_TIMEOUT) {
+          String lastTranscription = null;
+          if (!transcriptionSegments.isEmpty()) {
+            lastTranscription = transcriptionSegments.get(transcriptionSegments.size() - 1);
           }
           
-          // 检查转录结果是否有效
           if (lastTranscription != null && !lastTranscription.trim().isEmpty()) {
             System.out.println("[TRANSCRIPTION] 2秒无转录更新，处理识别结果: " + lastTranscription);
-
             try {
-              // 将全部消息历史记录发送给工作流
               callBotAndProcessResponse(coze, botID, userID, lastTranscription, voiceID);
             } catch (Exception e) {
               System.err.println("[CHAT] 调用聊天接口失败: " + e.getMessage());
               e.printStackTrace();
             }
-            
-            // 重置超时计时器
             lastTranscriptUpdateTime = System.currentTimeMillis();
-            
-            // 清空转录结果
-            if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
-              currentTranscription.set("");
-            } else {
-              transcriptionSegments.clear();
-            }
-            System.out.println("[TRANSCRIPTION] 转录结果已清空");
+            transcriptionSegments.clear();
           } else {
-            // 转录结果为空，只重置计时器
             lastTranscriptUpdateTime = System.currentTimeMillis();
           }
         }
@@ -377,6 +398,17 @@ public class AudioChatExampleAll {
     System.out.println("[DEBUG] 保持WebSocket连接，持续监听转录事件...");
     while (true) {
       TimeUnit.MILLISECONDS.sleep(1000);
+    }
+  }
+
+  // 处理转录结果（供Qwen ASR使用）
+  private static void processTranscriptionResult(String transcription) {
+    System.out.println("[TRANSCRIPTION] 处理转录结果: " + transcription);
+    try {
+      callBotAndProcessResponse(coze, botID, userID, transcription, voiceID);
+    } catch (Exception e) {
+      System.err.println("[CHAT] 调用聊天接口失败: " + e.getMessage());
+      e.printStackTrace();
     }
   }
 
@@ -455,8 +487,7 @@ public class AudioChatExampleAll {
                 if (event.getLogID() != null) {
                   String oldChatId = currentChatId;
                   currentChatId = event.getLogID();
-                  System.out.println(
-                      "[聊天] 更新currentChatId: " + oldChatId + " -> " + currentChatId);
+                  System.out.println("[聊天] 更新currentChatId: " + oldChatId + " -> " + currentChatId);
                 }
               } else if (ChatEventType.CONVERSATION_MESSAGE_DELTA.getValue().equals(eventValue)) {
                 if (event.getMessage() != null && event.getMessage().getContent() != null) {
@@ -466,48 +497,30 @@ public class AudioChatExampleAll {
                 if (event.getLogID() != null) {
                   String completedChatId = event.getLogID();
                   if (completedChatId.equals(currentChatId)) {
-                    System.out.println(
-                        "[聊天] 完成的聊天ID与当前匹配: " + completedChatId);
-                    
-                    // 发送清除音频缓冲区事件
-                    System.out.println("[ASYNC] 发送清除音频缓冲区事件...");
-                    if (transcriptionClient != null) {
-                      transcriptionClient.inputAudioBufferClear();
-                    }
-                    // 等待清除完成
-                    try {
-                      TimeUnit.MILLISECONDS.sleep(1000);
-                    } catch (InterruptedException e) {
-                      Thread.currentThread().interrupt();
-                    }
-                    
+                    System.out.println("[聊天] 完成的聊天ID与当前匹配: " + completedChatId);
+
                     // 将currentChatId置空
                     currentChatId = null;
                     System.out.println("[CHAT] 重置currentChatId为null");
-                    
+
                     // ASR继续监听，不发送finish-task和run-task指令
-                    
+
                     // Proceed with speech synthesis
                     // System.out.println("\n[CHAT] Bot response: " + botResponse.toString());
 
-                    // 添加AI回复到对话历史
-                    Message aiMessage = Message.buildAssistantAnswer(botResponse.toString());
-                    messageHistory.add(aiMessage);
-                    System.out.println("[历史记录] 添加AI回复到历史记录: " + botResponse.toString());
-
                     final String responseText = botResponse.toString();
                     // 中断所有正在进行的音频操作
-                    
+
                     // 取消之前的音频播放任务
                     interruptAudioPlayback();
-                    
+
                     // 等待一小段时间确保中断完成
                     try {
                       Thread.sleep(100);
                     } catch (InterruptedException e) {
                       Thread.currentThread().interrupt();
                     }
-                    
+
                     // 重置停止标志，允许新音频播放（必须在中断完成后设置）
                     shouldStopPlayback = false;
 
@@ -535,6 +548,11 @@ public class AudioChatExampleAll {
                                   Thread.interrupted();
                                   System.out.println("[ASYNC] Sleep interrupted, continuing...");
                                 }
+
+                                // 添加AI回复到对话历史（在清空缓存后立即添加）
+                                Message aiMessage = Message.buildAssistantAnswer(responseText);
+                                messageHistory.add(aiMessage);
+                                System.out.println("[历史记录] 添加AI回复到历史记录: " + responseText);
 
                                 // 根据语音服务选择进行语音合成
                                 if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
@@ -566,18 +584,29 @@ public class AudioChatExampleAll {
                                   if (matcher.find()) {
                                     tone = matcher.group(1);
                                     content = matcher.replaceFirst("").trim();
-                                    System.out.println(
-                                        "[语音] 语气: " + tone + " 内容: " + content);
+                                    // System.out.println("[语音] 语气: " + tone + " 内容: " + content);
                                   }
 
                                   // 保存实际使用的语音ID和语气
                                   final String actualVoiceId =
-                                      (voiceID != null && !voiceID.isEmpty())
-                                          ? voiceID
-                                          : "Cherry";
+                                      (QWEN_VOICE_ID != null && !QWEN_VOICE_ID.isEmpty()) ? QWEN_VOICE_ID : "Cherry";
 
                                   // 发送session.update指令
-                                  sendQwenTtsSessionUpdate(actualVoiceId, tone);
+                                  try {
+                                    sendQwenTtsSessionUpdate(actualVoiceId, tone);
+                                  } catch (Exception e) {
+                                    System.err.println("[错误] Qwen TTS session update 失败: " + e.getMessage());
+                                    // 如果失败，尝试重新初始化连接
+                                    qwenTtsRealtime = null;
+                                    initQwenTtsConnection();
+                                    TimeUnit.MILLISECONDS.sleep(2000);
+                                    if (qwenTtsRealtime != null) {
+                                      sendQwenTtsSessionUpdate(actualVoiceId, tone);
+                                    } else {
+                                      System.err.println("[错误] Qwen TTS 重新初始化失败，跳过本次合成");
+                                      return;
+                                    }
+                                  }
 
                                   // 发送待合成文本
                                   sendQwenTtsAppendText(content);
@@ -593,10 +622,11 @@ public class AudioChatExampleAll {
                                   ttsCompleteLatch.get().await();
                                 } else {
                                   // 使用Coze TTS进行语音合成
-                                  System.out.println("[COZE TTS] ========== 开始使用 Coze TTS 生成语音 ==========");
+                                  System.out.println(
+                                      "[COZE TTS] ========== 开始使用 Coze TTS 生成语音 ==========");
                                   // System.out.println("[COZE TTS] 合成文本: '" + responseText + "'");
                                   System.out.println("[COZE TTS] 语音ID: " + voiceID);
-                                  
+
                                   try {
                                     // 解析语气和内容
                                     String tone = "";
@@ -610,14 +640,20 @@ public class AudioChatExampleAll {
                                     if (matcher.find()) {
                                       tone = matcher.group(1);
                                       content = matcher.replaceFirst("").trim();
-                                      System.out.println("[COZE TTS] 解析到语气: '" + tone + "', 内容: '" + content + "'");
+                                      System.out.println(
+                                          "[COZE TTS] 解析到语气: '"
+                                              + tone
+                                              + "', 内容: '"
+                                              + content
+                                              + "'");
                                     }
 
                                     // 创建语音合成请求
                                     System.out.println("[COZE TTS] 创建语音合成请求...");
-                                    String actualVoiceId = (voiceID != null && !voiceID.isEmpty()) ? voiceID : "alloy";
+                                    String actualVoiceId =
+                                        (voiceID != null && !voiceID.isEmpty()) ? voiceID : "alloy";
                                     System.out.println("[COZE TTS] 使用语音ID: " + actualVoiceId);
-                                    
+
                                     CreateSpeechReq speechReq =
                                         CreateSpeechReq.builder()
                                             .input(content)
@@ -629,11 +665,12 @@ public class AudioChatExampleAll {
                                     System.out.println("[COZE TTS] 发送语音合成请求...");
                                     CreateSpeechResp speechResp =
                                         coze.audio().speech().create(speechReq);
-                                    
+
                                     System.out.println("[COZE TTS] 收到语音数据，开始播放...");
                                     byte[] speechBytes = speechResp.getResponse().bytes();
-                                    System.out.println("[COZE TTS] 语音数据大小: " + speechBytes.length + " 字节");
-                                    
+                                    System.out.println(
+                                        "[COZE TTS] 语音数据大小: " + speechBytes.length + " 字节");
+
                                     // 播放音频
                                     playAudio(speechBytes, 24000, 16, 1, true, false);
                                     System.out.println("[COZE TTS] ========== 语音播放完成 ==========");
@@ -654,10 +691,8 @@ public class AudioChatExampleAll {
 
                     System.out.println("[主线程] 继续录制，不等待语音播放完成");
                   } else {
-                    System.out.println(
-                        "[聊天] 完成的聊天ID与当前不匹配，跳过语音合成");
-                    System.out.println(
-                        "[聊天] 当前: " + currentChatId + " 完成: " + completedChatId);
+                    System.out.println("[聊天] 完成的聊天ID与当前不匹配，跳过语音合成");
+                    System.out.println("[聊天] 当前: " + currentChatId + " 完成: " + completedChatId);
                     // Skip speech synthesis for this completed chat
                     // ID不匹配，不清空currentChatId，保持当前对话状态
                   }
@@ -684,197 +719,199 @@ public class AudioChatExampleAll {
     isResponding.set(true);
   }
 
-
-
-
-
-
-
-
-
-  // 调用百炼语音识别服务
-  private static void startBaichuanSpeechRecognition() {
+  // 初始化Qwen ASR客户端
+  private static void initQwenAsrClient() {
     if (DASHSCOPE_API_KEY == null || DASHSCOPE_API_KEY.isEmpty()) {
       System.err.println("[错误] DASHSCOPE_API_KEY环境变量未设置");
       return;
     }
 
-    OkHttpClient client = new OkHttpClient();
+    try {
+      OmniRealtimeParam param =
+          OmniRealtimeParam.builder()
+              .model("qwen3-asr-flash-realtime")
+              .url("wss://dashscope.aliyuncs.com/api-ws/v1/realtime")
+              .apikey(DASHSCOPE_API_KEY)
+              .build();
 
-    Request request =
-        new Request.Builder()
-            .url(WEBSOCKET_URL)
-            .addHeader("Authorization", "Bearer " + DASHSCOPE_API_KEY)
-            .addHeader("user-agent", "Baichuan-Speech-Client/1.0")
-            .build();
+      qwenAsrConversation =
+          new OmniRealtimeConversation(
+              param,
+              new OmniRealtimeCallback() {
+                @Override
+                public void onOpen() {
+                  System.out.println("[QWEN ASR] WebSocket连接已建立");
+                  isConnected.set(true);
+                }
 
-    webSocket =
-        client.newWebSocket(
-            request,
-            new WebSocketListener() {
-              @Override
-              public void onOpen(WebSocket webSocket, Response response) {
-                System.out.println("[百炼ASR] WebSocket连接已建立");
-                isConnected.set(true);
-                sendRunTaskCommand();
-              }
+                @Override
+                public void onEvent(JsonObject message) {
+                  handleQwenAsrEvent(message);
+                }
 
-              @Override
-              public void onMessage(WebSocket webSocket, String text) {
-                handleServerEvent(text);
-              }
+                @Override
+                public void onClose(int code, String reason) {
+                  isConnected.set(false);
+                  qwenAsrSessionStarted.set(false);
+                  System.out.println("[QWEN ASR] WebSocket连接已关闭: " + code + ", 原因: " + reason);
+                }
+              });
 
-              @Override
-              public void onMessage(WebSocket webSocket, ByteString bytes) {
-                // 百炼服务不会返回二进制消息，只返回JSON事件
-              }
+      qwenAsrConversation.connect();
 
-              @Override
-              public void onClosing(WebSocket webSocket, int code, String reason) {
-                webSocket.close(1000, null);
-                isConnected.set(false);
-                System.out.println("[百炼ASR] WebSocket连接正在关闭: " + reason);
-              }
+      // 等待连接建立并配置会话
+      TimeUnit.MILLISECONDS.sleep(500);
 
-              @Override
-              public void onClosed(WebSocket webSocket, int code, String reason) {
-                isConnected.set(false);
-                System.out.println("[百炼ASR] WebSocket连接已关闭: " + code + ", 原因: " + reason);
-              }
+      // 配置会话参数
+      OmniRealtimeTranscriptionParam transcriptionParam = new OmniRealtimeTranscriptionParam();
+      transcriptionParam.setLanguage("zh");
+      transcriptionParam.setInputSampleRate(16000);
+      transcriptionParam.setInputAudioFormat("pcm");
 
-              @Override
-              public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-                System.err.println("[百炼ASR] WebSocket连接失败: " + t.getMessage());
-                isConnected.set(false);
-              }
-            });
-  }
+      OmniRealtimeConfig.OmniRealtimeConfigBuilder configBuilder =
+          OmniRealtimeConfig.builder()
+              .modalities(Arrays.asList(OmniRealtimeModality.TEXT))
+              .transcriptionConfig(transcriptionParam);
+      
+      // 根据模式配置VAD
+      if (QWEN_ASR_VAD_MODE) {
+        // VAD模式：启用自动断句
+        configBuilder.enableTurnDetection(true);
+        configBuilder.turnDetectionType("server_vad");
+        configBuilder.turnDetectionThreshold(0.0f);
+        configBuilder.turnDetectionSilenceDurationMs(3000);
+        System.out.println("[QWEN ASR] 使用VAD模式（自动断句），静音检测时长: 2000ms");
+      } else {
+        // 手动提交模式：禁用VAD
+        configBuilder.enableTurnDetection(false);
+        System.out.println("[QWEN ASR] 使用手动提交模式（非VAD）");
+      }
+      
+      OmniRealtimeConfig config = configBuilder.build();
 
-  // 发送运行任务命令
-  private static void sendRunTaskCommand() {
-    JSONObject command = new JSONObject();
-    JSONObject header = new JSONObject();
-    header.put("action", "run-task");
-    header.put("task_id", taskId);
-    header.put("streaming", "duplex");
+      qwenAsrConversation.updateSession(config);
+      System.out.println("[QWEN ASR] 会话配置已更新");
 
-    JSONObject payload = new JSONObject();
-    payload.put("task_group", "audio");
-    payload.put("task", "asr");
-    payload.put("function", "recognition");
-    payload.put("model", "fun-asr-realtime"); // 使用Fun-ASR模型
-
-    JSONObject parameters = new JSONObject();
-    parameters.put("format", "pcm");
-    parameters.put("sample_rate", 16000); // 按照文档要求使用16000采样率
-    parameters.put("language_hints", Arrays.asList("zh"));
-    parameters.put("punctuation_prediction_enabled", true);
-    parameters.put("inverse_text_normalization_enabled", true);
-    parameters.put("max_sentence_silence", 800); // 设置VAD断句静音时长阈值为800ms
-    parameters.put("multi_threshold_mode_enabled", true); // 防止VAD断句切割过长
-    parameters.put("heartbeat", true); // 启用心跳保持长连接
-
-    payload.put("parameters", parameters);
-    payload.put("input", new JSONObject());
-
-    command.put("header", header);
-    command.put("payload", payload);
-
-    webSocket.send(command.toJSONString());
-    System.out.println("[百炼ASR] 已发送run-task命令，任务ID: " + taskId);
-  }
-
-  // 发送完成任务命令
-  private static void sendFinishTaskCommand() {
-    if (webSocket == null || !isConnected.get()) {
-      System.err.println("[百炼ASR] WebSocket未连接，无法发送finish-task命令");
-      return;
+    } catch (Exception e) {
+      System.err.println("[QWEN ASR] 初始化失败: " + e.getMessage());
+      e.printStackTrace();
     }
-
-    JSONObject command = new JSONObject();
-    JSONObject header = new JSONObject();
-    header.put("action", "finish-task");
-    header.put("task_id", taskId);
-    header.put("streaming", "duplex");
-
-    JSONObject payload = new JSONObject();
-    payload.put("input", new JSONObject());
-
-    command.put("header", header);
-    command.put("payload", payload);
-
-    webSocket.send(command.toJSONString());
-    System.out.println("[百炼ASR] 已发送finish-task命令，任务ID: " + taskId);
   }
 
-  // 处理服务器事件
-  private static void handleServerEvent(String text) {
-    // 心跳事件不需要打印日志，减少输出噪音
-    if (text.contains("\"event\":\"heartbeat\"")) {
-      // 收到心跳，更新最后活动时间
-      lastTranscriptUpdateTime = System.currentTimeMillis();
-      return;
-    }
-    
-    // System.out.println("[百炼转录] 收到服务器事件: " + text);
-    
-    JSONObject event = JSON.parseObject(text);
-    JSONObject header = event.getJSONObject("header");
-    String eventType = header.getString("event");
-    
-    System.out.println("[百炼转录] 事件类型: " + eventType);
+  // 处理Qwen ASR事件
+  private static void handleQwenAsrEvent(JsonObject message) {
+    String type = message.get("type").getAsString();
+    System.out.println("[QWEN ASR] 事件类型: " + type);
 
-    switch (eventType) {
-      case "task-started":
-        System.out.println("[百炼转录] 任务启动成功");
+    switch (type) {
+      case "session.created":
+        System.out.println(
+            "[QWEN ASR] 会话已创建: "
+                + message.get("session").getAsJsonObject().get("id").getAsString());
         break;
-      case "result-generated":
-        handleRecognitionResult(event);
+      case "session.updated":
+        System.out.println("[QWEN ASR] 会话配置已更新");
+        qwenAsrSessionStarted.set(true);
         break;
-      case "task-finished":
-        System.out.println("[百炼转录] 任务完成");
-        // 任务结束后可以重新开始新任务
-        taskId = UUID.randomUUID().toString();
-        sendRunTaskCommand();
+      case "input_audio_buffer.speech_started":
+        // 此事件仅在VAD模式下发送，非VAD模式下不会收到
+        System.out.println("[QWEN ASR] 检测到语音开始(VAD模式)，停止当前播放并清空缓存");
+        interruptAudioPlayback();
+        if (audioPlayer != null) {
+          audioPlayer.cancel();
+          System.out.println("[QWEN ASR] 已清空音频播放缓存");
+        }
         break;
-      case "task-failed":
-        String errorMessage = header.getString("error_message");
-        System.err.println("[百炼转录] 任务失败: " + errorMessage);
+      case "input_audio_buffer.speech_stopped":
+        // 此事件仅在VAD模式下发送，非VAD模式下不会收到
+        System.out.println("[QWEN ASR] 检测到语音结束(VAD模式)");
+        break;
+      case "input_audio_buffer.committed":
+        System.out.println("[QWEN ASR] 音频缓冲区已提交");
+        break;
+      case "conversation.item.created":
+        System.out.println("[QWEN ASR] 对话项已创建");
+        break;
+      case "conversation.item.input_audio_transcription.text":
+        // 实时识别结果（手动提交模式下，text事件只用于显示，不累积）
+        String text = message.get("text").getAsString();
+        String stash = message.has("stash") ? message.get("stash").getAsString() : "";
+        String fullText = text + stash;
+
+        lastTranscriptUpdateTime = System.currentTimeMillis();
+        System.out.println("[QWEN ASR] 实时转录结果: " + fullText);
+
+        // 收到实时转录结果时，打断所有播放，清空播放缓存
+        interruptAudioPlayback();
+        System.out.println("[QWEN ASR] 已打断播放并清空缓存");
+
+        // 手动提交模式下，只保存最新结果，不累积
+        currentTranscription.set(fullText);
+        break;
+      case "conversation.item.input_audio_transcription.completed":
+        // 最终识别结果
+        String finalTranscript = message.get("transcript").getAsString();
+        System.out.println("[QWEN ASR] 收到completed事件，最终转录结果: " + finalTranscript);
+        
+        // 处理最终转录结果（无论waitingForCompleted状态如何，都处理completed事件）
+        processTranscriptionResult(finalTranscript);
+        waitingForCompleted.set(false);
+        currentTranscription.set("");
+        lastTranscriptUpdateTime = System.currentTimeMillis();
+        lastSoundTime = System.currentTimeMillis(); // 重置音频输入时间，继续监听
+        
+        // 不重新建立连接，继续监听新的语音输入
+        System.out.println("[QWEN ASR] 处理完成，继续监听...");
+        break;
+      case "conversation.item.input_audio_transcription.failed":
+        System.err.println(
+            "[QWEN ASR] 识别失败: "
+                + message.get("error").getAsJsonObject().get("message").getAsString());
+        break;
+      case "session.finished":
+        System.out.println("[QWEN ASR] 会话已结束");
+        qwenAsrSessionStarted.set(false);
+        waitingForCompleted.set(false); // 重置等待标记
+        // 服务端关闭了连接，需要重新初始化以继续监听
+        System.out.println("[QWEN ASR] 准备重新初始化连接...");
+        reconnectQwenAsr();
+        break;
+      case "error":
+        System.err.println(
+            "[QWEN ASR] 错误: "
+                + message.get("error").getAsJsonObject().get("message").getAsString());
         break;
       default:
-        System.out.println("[百炼转录] 未知事件类型: " + eventType);
+        System.out.println("[QWEN ASR] 未处理的事件类型: " + type);
     }
   }
 
-  // 处理识别结果 - 根据currentChatId判断赋值或拼接
-  private static void handleRecognitionResult(JSONObject event) {
-    JSONObject payload = event.getJSONObject("payload");
-    JSONObject output = payload.getJSONObject("output");
-    JSONObject sentence = output.getJSONObject("sentence");
-    String text = sentence.getString("text");
-
-    lastTranscriptUpdateTime = System.currentTimeMillis();
-    System.out.println("[百炼转录] 实时转录结果: " + text);
-
-    // 判断currentChatId是否为空
-    if (currentChatId == null || currentChatId.isEmpty()) {
-      // currentChatId为空：直接将生成的文本赋值给识别缓冲区
-      currentTranscription.set(text);
-      System.out.println("[百炼转录] 当前识别缓冲区: " + text);
-    } else {
-      // currentChatId不为空：将历史记录中最后一条与当前更新的进行拼接
-      String existingText = currentTranscription.get();
-      if (existingText != null && !existingText.isEmpty()) {
-        // 有现有内容，进行拼接
-        String combinedText = existingText + text;
-        currentTranscription.set(combinedText);
-        System.out.println("[百炼转录] 拼接后识别缓冲区: " + combinedText);
-      } else {
-        // 没有现有内容，直接赋值
-        currentTranscription.set(text);
-        System.out.println("[百炼转录] 当前识别缓冲区: " + text);
+  // 重新连接Qwen ASR服务
+  private static void reconnectQwenAsr() {
+    System.out.println("[QWEN ASR] 正在重新连接...");
+    // 关闭旧连接
+    if (qwenAsrConversation != null) {
+      try {
+        qwenAsrConversation.close();
+      } catch (Exception e) {
+        // 忽略关闭时的错误
       }
+      qwenAsrConversation = null;
     }
+    isConnected.set(false);
+    qwenAsrSessionStarted.set(false);
+
+    // 延迟后重新初始化
+    new Thread(
+            () -> {
+              try {
+                TimeUnit.MILLISECONDS.sleep(500);
+                initQwenAsrClient();
+              } catch (Exception e) {
+                System.err.println("[QWEN ASR] 重新连接失败: " + e.getMessage());
+              }
+            })
+        .start();
   }
 
   // Coze转录回调处理
@@ -901,7 +938,7 @@ public class AudioChatExampleAll {
     public void onTranscriptionsMessageUpdate(
         WebsocketsAudioTranscriptionsClient client, TranscriptionsMessageUpdateEvent event) {
       // System.out.println("[COZE ASR] ========== onTranscriptionsMessageUpdate 被调用 ==========");
-      
+
       // 中断当前音频播放
       interruptAudioPlayback();
 
@@ -939,13 +976,15 @@ public class AudioChatExampleAll {
           coze.websockets()
               .audio()
               .transcriptions()
-              .create(new WebsocketsAudioTranscriptionsCreateReq(new TranscriptionCallbackHandler()));
+              .create(
+                  new WebsocketsAudioTranscriptionsCreateReq(new TranscriptionCallbackHandler()));
       System.out.println("[Coze转录] transcriptionClient 创建成功: " + transcriptionClient);
-      
+
       // 配置转录参数
       System.out.println("[Coze转录] 配置转录参数...");
-      System.out.println("[Coze转录] 采样率: " + SAMPLE_RATE + ", 声道: " + CHANNELS + ", 位深: 16, 编码: pcm");
-      
+      System.out.println(
+          "[Coze转录] 采样率: " + SAMPLE_RATE + ", 声道: " + CHANNELS + ", 位深: 16, 编码: pcm");
+
       com.coze.openapi.client.websocket.event.model.InputAudio inputAudio =
           com.coze.openapi.client.websocket.event.model.InputAudio.builder()
               .sampleRate(SAMPLE_RATE)
@@ -969,8 +1008,6 @@ public class AudioChatExampleAll {
     }
   }
 
-
-
   // 初始化Qwen TTS连接
   private static void initQwenTtsConnection() {
     if (DASHSCOPE_API_KEY == null || DASHSCOPE_API_KEY.isEmpty()) {
@@ -979,52 +1016,61 @@ public class AudioChatExampleAll {
     }
 
     try {
-      QwenTtsRealtimeParam param = QwenTtsRealtimeParam.builder()
-          .model("qwen3-tts-instruct-flash-realtime")
-          .url("wss://dashscope.aliyuncs.com/api-ws/v1/realtime")
-          .apikey(DASHSCOPE_API_KEY)
-          .build();
+      QwenTtsRealtimeParam param =
+          QwenTtsRealtimeParam.builder()
+              .model("qwen3-tts-instruct-flash-realtime")
+              .url("wss://dashscope.aliyuncs.com/api-ws/v1/realtime")
+              .apikey(DASHSCOPE_API_KEY)
+              .build();
 
       audioPlayer = new RealtimePcmPlayer(24000);
 
-      qwenTtsRealtime = new QwenTtsRealtime(param, new QwenTtsRealtimeCallback() {
-        @Override
-        public void onOpen() {
-          System.out.println("Qwen TTS SDK connection established");
-        }
+      qwenTtsRealtime =
+          new QwenTtsRealtime(
+              param,
+              new QwenTtsRealtimeCallback() {
+                @Override
+                public void onOpen() {
+                  System.out.println("Qwen TTS SDK connection established");
+                }
 
-        @Override
-        public void onEvent(JsonObject message) {
-          String type = message.get("type").getAsString();
-          switch (type) {
-            case "session.created":
-              System.out.println(
-                  "start session: "
-                      + message.get("session").getAsJsonObject().get("id").getAsString());
-              isSessionStarted.set(true);
-              break;
-            case "response.audio.delta":
-              String recvAudioB64 = message.get("delta").getAsString();
-              audioPlayer.write(recvAudioB64);
-              break;
-            case "response.done":
-              System.out.println("response done");
-              ttsCompleteLatch.get().countDown();
-              break;
-            case "session.finished":
-              System.out.println("session finished");
-              ttsCompleteLatch.get().countDown();
-              break;
-            default:
-              break;
-          }
-        }
+                @Override
+                public void onEvent(JsonObject message) {
+                  String type = message.get("type").getAsString();
+                  switch (type) {
+                    case "session.created":
+                      System.out.println(
+                          "start session: "
+                              + message.get("session").getAsJsonObject().get("id").getAsString());
+                      isSessionStarted.set(true);
+                      break;
+                    case "response.audio.delta":
+                      String recvAudioB64 = message.get("delta").getAsString();
+                      audioPlayer.write(recvAudioB64);
+                      break;
+                    case "response.done":
+                      System.out.println("response done");
+                      ttsCompleteLatch.get().countDown();
+                      break;
+                    case "session.finished":
+                      System.out.println("session finished");
+                      isSessionStarted.set(false);
+                      ttsCompleteLatch.get().countDown();
+                      break;
+                    default:
+                      break;
+                  }
+                }
 
-        @Override
-        public void onClose(int code, String reason) {
-          System.err.println("Qwen TTS SDK connection closed code: " + code + ", reason: " + reason);
-        }
-      });
+                @Override
+                public void onClose(int code, String reason) {
+                  System.err.println(
+                      "Qwen TTS SDK connection closed code: " + code + ", reason: " + reason);
+                  // 连接关闭后，重置连接对象，以便下次重新初始化
+                  qwenTtsRealtime = null;
+                  isSessionStarted.set(false);
+                }
+              });
 
       qwenTtsRealtime.connect();
       // 等待连接建立
@@ -1048,17 +1094,12 @@ public class AudioChatExampleAll {
       return;
     }
 
-    // 如果会话已经开始，不允许更新
-    if (isSessionStarted.get()) {
-      System.err.println("ERROR: Cannot update session after it has started");
-      return;
-    }
-
     QwenTtsRealtimeConfig config =
         QwenTtsRealtimeConfig.builder()
             .voice((voiceId != null && !voiceId.isEmpty()) ? voiceId : QWEN_VOICE_ID)
             .responseFormat(QwenTtsRealtimeAudioFormat.PCM_24000HZ_MONO_16BIT)
-            .mode("server_commit")
+            .mode("commit")
+            .speechRate(1.1f)
             .instructions(instructions)
             .optimizeInstructions(instructions != null && !instructions.isEmpty())
             .build();
@@ -1089,7 +1130,7 @@ public class AudioChatExampleAll {
       return;
     }
 
-    // 仅在server_commit模式下需要commit
+    // commit模式下需要调用commit()提交缓冲区，然后调用finish()结束会话
     qwenTtsRealtime.commit();
     qwenTtsRealtime.finish();
     System.out.println("Sent Qwen TTS session.finish command");
@@ -1101,10 +1142,10 @@ public class AudioChatExampleAll {
   private static void interruptAudioPlayback() {
     // 设置停止标志 - 这会让正在播放的音频及时停止
     shouldStopPlayback = true;
-    
+
     // 注意：不要调用 thread.interrupt() 或 future.cancel(true)，
     // 因为这会中断正在进行的 Coze TTS 网络请求，导致 InterruptedIOException
-    
+
     // 中断SDK音频播放器
     if (audioPlayer != null) {
       try {
@@ -1146,9 +1187,10 @@ public class AudioChatExampleAll {
       boolean signed,
       boolean bigEndian)
       throws Exception {
-    
+
     System.out.println("[AUDIO] 开始播放音频，数据大小: " + audioData.length + " 字节");
-    System.out.println("[AUDIO] 音频格式: " + sampleRate + "Hz, " + sampleSizeInBits + "bit, " + channels + "声道");
+    System.out.println(
+        "[AUDIO] 音频格式: " + sampleRate + "Hz, " + sampleSizeInBits + "bit, " + channels + "声道");
 
     // 使用Java Sound API播放音频
     javax.sound.sampled.AudioFormat audioFormat =
@@ -1169,7 +1211,7 @@ public class AudioChatExampleAll {
       audioLine.write(audioData, offset, length);
       offset += length;
     }
-    
+
     if (shouldStopPlayback) {
       System.out.println("[AUDIO] 音频播放被中断");
     } else {
@@ -1178,7 +1220,7 @@ public class AudioChatExampleAll {
         System.out.println("[AUDIO] 音频播放完成");
       }
     }
-    
+
     if (audioLine != null) {
       try {
         audioLine.close();
@@ -1194,13 +1236,13 @@ public class AudioChatExampleAll {
     System.out.println("=== Creating conversation ====");
 
     if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
-      // 百炼语音识别不需要创建会话，直接使用WebSocket连接
+      // Qwen ASR不需要创建Coze会话，直接使用DashScope连接
       conversationId = UUID.randomUUID().toString();
     } else {
       // 使用Coze API创建真实会话
       CreateConversationReq createConversationReq = new CreateConversationReq();
       createConversationReq.setBotID(botID);
-      
+
       CreateConversationResp conversation = coze.conversations().create(createConversationReq);
       conversationId = conversation.getConversation().getId();
     }
@@ -1213,21 +1255,61 @@ public class AudioChatExampleAll {
   // 获取音频设备列表（对应前端的getUserMedia和enumerateDevices）
   private static List<AudioDevice> getAudioDevices() throws Exception {
     List<AudioDevice> devices = new ArrayList<>();
+    System.out.println("[音频设备] 开始枚举音频设备...");
 
-    // 获取所有音频输入设备
-    javax.sound.sampled.Mixer.Info[] mixerInfos = AudioSystem.getMixerInfo();
-    for (javax.sound.sampled.Mixer.Info mixerInfo : mixerInfos) {
+    // 获取所有音频输入设备 - 在单独的线程中执行以避免阻塞
+    final javax.sound.sampled.Mixer.Info[][] mixerInfosHolder = new javax.sound.sampled.Mixer.Info[1][];
+    Thread enumerateThread = new Thread(() -> {
       try {
+        mixerInfosHolder[0] = AudioSystem.getMixerInfo();
+      } catch (Exception e) {
+        System.err.println("[音频设备] 枚举失败: " + e.getMessage());
+      }
+    });
+    enumerateThread.setDaemon(true);
+    enumerateThread.start();
+    enumerateThread.join(5000); // 最多等待5秒
+    
+    if (enumerateThread.isAlive()) {
+      System.err.println("[音频设备] 枚举超时，使用默认设备");
+      enumerateThread.interrupt();
+      // 返回空列表，让调用方使用默认设备
+      return devices;
+    }
+    
+    javax.sound.sampled.Mixer.Info[] mixerInfos = mixerInfosHolder[0];
+    if (mixerInfos == null) {
+      System.err.println("[音频设备] 无法获取设备列表");
+      return devices;
+    }
+    
+    System.out.println("[音频设备] 找到 " + mixerInfos.length + " 个音频设备");
+
+    for (javax.sound.sampled.Mixer.Info mixerInfo : mixerInfos) {
+      // 跳过可能导致卡住的设备名称
+      String name = mixerInfo.getName().toLowerCase();
+      if (name.contains("port") || name.contains("unknown") || name.contains("primary")) {
+        System.out.println("[音频设备] 跳过可能不稳定的设备: " + mixerInfo.getName());
+        continue;
+      }
+      
+      try {
+        System.out.println("[音频设备] 检查设备: " + mixerInfo.getName());
         javax.sound.sampled.Mixer mixer = AudioSystem.getMixer(mixerInfo);
+        
+        // 简单检查，不使用超时机制（避免线程问题）
         if (mixer.isLineSupported(new DataLine.Info(TargetDataLine.class, JAVA_AUDIO_FORMAT))) {
           devices.add(new AudioDevice(mixerInfo));
+          System.out.println("[音频设备] ✓ 支持输入: " + mixerInfo.getName());
         }
       } catch (Exception e) {
         // 跳过无法访问的设备
+        System.out.println("[音频设备] ✗ 跳过设备: " + mixerInfo.getName() + " - " + e.getMessage());
         continue;
       }
     }
 
+    System.out.println("[音频设备] 枚举完成，找到 " + devices.size() + " 个输入设备");
     return devices;
   }
 
@@ -1261,6 +1343,11 @@ public class AudioChatExampleAll {
         new java.util.concurrent.ConcurrentLinkedQueue<>();
     private java.util.Queue<byte[]> RawAudioBuffer =
         new java.util.concurrent.ConcurrentLinkedQueue<>();
+    // 预缓冲：积累至少200ms的数据才开始播放，避免网络抖动导致的卡顿
+    private static final int PRE_BUFFER_MS = 200;
+    private java.util.concurrent.atomic.AtomicBoolean preBufferReady =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile int bufferedDataSize = 0;
 
     // 构造函数初始化音频格式和音频线路
     public RealtimePcmPlayer(int sampleRate) throws javax.sound.sampled.LineUnavailableException {
@@ -1268,7 +1355,9 @@ public class AudioChatExampleAll {
       this.audioFormat = new javax.sound.sampled.AudioFormat(this.sampleRate, 16, 1, true, false);
       DataLine.Info info = new DataLine.Info(SourceDataLine.class, audioFormat);
       line = (SourceDataLine) AudioSystem.getLine(info);
-      line.open(audioFormat);
+      // 设置较大的缓冲区以减少卡顿
+      int bufferSize = sampleRate * 2 * 2; // 2秒的缓冲区
+      line.open(audioFormat, bufferSize);
       line.start();
       decoderThread =
           new Thread(
@@ -1280,9 +1369,10 @@ public class AudioChatExampleAll {
                     if (b64Audio != null) {
                       byte[] rawAudio = Base64.getDecoder().decode(b64Audio);
                       RawAudioBuffer.add(rawAudio);
+                      bufferedDataSize += rawAudio.length;
                     } else {
                       try {
-                        Thread.sleep(100);
+                        Thread.sleep(5);
                       } catch (InterruptedException e) {
                         throw new RuntimeException(e);
                       }
@@ -1296,8 +1386,25 @@ public class AudioChatExampleAll {
                 @Override
                 public void run() {
                   while (!stopped.get()) {
+                    // 预缓冲检查：积累足够数据后再开始播放
+                    if (!preBufferReady.get()) {
+                      int preBufferBytes = PRE_BUFFER_MS * sampleRate * 2 / 1000;
+                      if (bufferedDataSize >= preBufferBytes) {
+                        preBufferReady.set(true);
+                        System.out.println("[AUDIO] 预缓冲完成，开始播放...");
+                      } else {
+                        try {
+                          Thread.sleep(10);
+                        } catch (InterruptedException e) {
+                          throw new RuntimeException(e);
+                        }
+                        continue;
+                      }
+                    }
+
                     byte[] rawAudio = RawAudioBuffer.poll();
                     if (rawAudio != null) {
+                      bufferedDataSize -= rawAudio.length;
                       try {
                         playChunk(rawAudio);
                       } catch (IOException e) {
@@ -1307,7 +1414,7 @@ public class AudioChatExampleAll {
                       }
                     } else {
                       try {
-                        Thread.sleep(100);
+                        Thread.sleep(5);
                       } catch (InterruptedException e) {
                         throw new RuntimeException(e);
                       }
@@ -1319,7 +1426,7 @@ public class AudioChatExampleAll {
       playerThread.start();
     }
 
-    // 播放一个音频块并阻塞直到播放完成
+    // 播放一个音频块
     private void playChunk(byte[] chunk) throws IOException, InterruptedException {
       if (chunk == null || chunk.length == 0) return;
 
@@ -1327,9 +1434,7 @@ public class AudioChatExampleAll {
       while (bytesWritten < chunk.length) {
         bytesWritten += line.write(chunk, bytesWritten, chunk.length - bytesWritten);
       }
-      int audioLength = chunk.length / (this.sampleRate * 2 / 1000);
-      // 等待缓冲区中的音频播放完成
-      Thread.sleep(audioLength - 10);
+      // 不阻塞等待，让播放器继续处理下一个块
     }
 
     public void write(String b64Audio) {
@@ -1339,12 +1444,14 @@ public class AudioChatExampleAll {
     public void cancel() {
       b64AudioBuffer.clear();
       RawAudioBuffer.clear();
+      bufferedDataSize = 0;
+      preBufferReady.set(false);
     }
 
     public void waitForComplete() throws InterruptedException {
       // 等待所有缓冲区中的音频数据播放完成
       while (!b64AudioBuffer.isEmpty() || !RawAudioBuffer.isEmpty()) {
-        Thread.sleep(100);
+        Thread.sleep(50);
       }
       // 等待音频线路播放完成
       line.drain();
