@@ -115,6 +115,10 @@ public class AudioChatExampleAll {
   private static String conversationId = null;
   private static String currentChatId = null;
 
+  // 待播放的响应文本（用于延迟添加历史记录和清空缓存）
+  private static AtomicReference<String> pendingResponseText = new AtomicReference<>();
+  private static AtomicBoolean historyAdded = new AtomicBoolean(false);
+
   // 音频播放队列管理 - 使用缓存线程池，允许立即处理新任务
   private static ExecutorService audioPlaybackExecutor =
       Executors.newCachedThreadPool(
@@ -126,6 +130,17 @@ public class AudioChatExampleAll {
 
   // 音频播放停止标志
   private static volatile boolean shouldStopPlayback = false;
+
+  // 用户说话状态标志（打断TTS后设置，用于跳过回声检测）
+  private static volatile boolean userSpeaking = false;
+  private static volatile long userSpeakingStartTime = 0;
+  private static final long USER_SPEAKING_TIMEOUT = 5000; // 用户说话状态超时5秒
+
+  // 回声消除相关变量
+  private static final int ECHO_BUFFER_SIZE = 20; // 保存最近20个音频块用于回声检测
+  private static final List<byte[]> recentPlaybackAudio = new ArrayList<>();
+  private static final Object echoLock = new Object();
+  private static final double ECHO_SIMILARITY_THRESHOLD = 0.75; // 相似度阈值（降低以更好检测回声）
 
   // 主函数
   public static void main(String[] args) throws Exception {
@@ -297,25 +312,53 @@ public class AudioChatExampleAll {
           }
         }
         double avgEnergy = count > 0 ? sum / count : 0;
+
+        // 检查用户说话状态是否超时
+        if (userSpeaking && System.currentTimeMillis() - userSpeakingStartTime > USER_SPEAKING_TIMEOUT) {
+          userSpeaking = false;
+          System.out.println("[AUDIO] 用户说话状态超时，重置为false");
+        }
+
+        // 检测是否为回声（扬声器播放的声音被麦克风录回）
+        // 如果用户正在说话状态，跳过回声检测
+        boolean isEchoAudio = false;
+        if (!userSpeaking) {
+          isEchoAudio = isEcho(Arrays.copyOf(audioBuffer, bytesRead));
+        }
+
+        // 判断是否为有效的用户声音（不是回声且有足够能量）
+        boolean isUserVoice = hasSound && !isEchoAudio;
+
         if (hasSound) {
           // System.out.println("[AUDIO] 检测到语音输入，平均能量: " + String.format("%.0f", avgEnergy) + ",
           // 最大振幅: " + maxSample);
+          System.out.println("[AUDIO] 检测到声音，isResponding=" + isResponding.get() + ", isEcho=" + isEchoAudio + ", userSpeaking=" + userSpeaking);
           if (isResponding.get()) {
             // 如果检测到声音且正在播放TTS，自动打断
             System.out.println("[AUDIO] 检测到用户说话，自动打断TTS播放");
             interruptAudioPlayback();
+            // 设置用户说话状态，跳过后续回声检测
+            userSpeaking = true;
+            userSpeakingStartTime = System.currentTimeMillis();
+            System.out.println("[AUDIO] 设置用户说话状态，跳过回声检测");
             // 重置会话状态
             isSessionStarted.set(false);
           }
         }
+
         // 根据语音服务选择发送音频数据
         if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
-          // 直接发送音频数据到Qwen ASR服务
-          if (qwenAsrConversation != null && qwenAsrSessionStarted.get()) {
+          // 直接发送音频数据到Qwen ASR服务（非回声才发送）
+          if (qwenAsrConversation != null && qwenAsrSessionStarted.get() && !isEchoAudio) {
             String audioBase64 =
                 Base64.getEncoder().encodeToString(Arrays.copyOf(audioBuffer, bytesRead));
             qwenAsrConversation.appendAudio(audioBase64);
             // 只有在有声音时才更新最后发送音频的时间
+            if (hasSound) {
+              lastSoundTime = System.currentTimeMillis();
+            }
+          } else if (isEchoAudio) {
+            // 回声不发送，但仍更新时间避免超时
             if (hasSound) {
               lastSoundTime = System.currentTimeMillis();
             }
@@ -326,14 +369,16 @@ public class AudioChatExampleAll {
             System.out.println("[AUDIO] qwenAsrSessionStarted: " + qwenAsrSessionStarted.get());
           }
         } else {
-          // 直接发送音频数据到Coze服务
-          if (transcriptionClient != null) {
+          // 直接发送音频数据到Coze服务（非回声才发送）
+          if (transcriptionClient != null && !isEchoAudio) {
             try {
               transcriptionClient.inputAudioBufferAppend(Arrays.copyOf(audioBuffer, bytesRead));
             } catch (Exception e) {
               System.err.println("[COZE ASR] 发送音频数据失败: " + e.getMessage());
               e.printStackTrace();
             }
+          } else if (isEchoAudio) {
+            // 回声不发送
           } else {
             System.err.println("[COZE ASR] transcriptionClient 为 null，无法发送音频");
           }
@@ -488,6 +533,11 @@ public class AudioChatExampleAll {
                   String oldChatId = currentChatId;
                   currentChatId = event.getLogID();
                   System.out.println("[聊天] 更新currentChatId: " + oldChatId + " -> " + currentChatId);
+                  // 新对话开始时，重置historyAdded标志，防止旧对话的响应被添加到历史记录
+                  if (oldChatId != null && !oldChatId.equals(currentChatId)) {
+                    historyAdded.set(true); // 设置为true，阻止旧对话添加历史记录
+                    System.out.println("[聊天] 新对话开始，设置historyAdded=true阻止旧对话添加历史记录");
+                  }
                 }
               } else if (ChatEventType.CONVERSATION_MESSAGE_DELTA.getValue().equals(eventValue)) {
                 if (event.getMessage() != null && event.getMessage().getContent() != null) {
@@ -509,6 +559,11 @@ public class AudioChatExampleAll {
                     // System.out.println("\n[CHAT] Bot response: " + botResponse.toString());
 
                     final String responseText = botResponse.toString();
+                    // 保存待播放的响应文本，延迟添加历史记录和清空缓存到播放前
+                    pendingResponseText.set(responseText);
+                    historyAdded.set(false);
+                    System.out.println("[聊天] 保存待播放响应文本，延迟添加历史记录和清空缓存到播放前");
+
                     // 中断所有正在进行的音频操作
 
                     // 取消之前的音频播放任务
@@ -534,25 +589,6 @@ public class AudioChatExampleAll {
                                 // 注意：interruptAudioPlayback() 已在外部调用，这里不再重复调用
                                 // 重置会话状态
                                 isSessionStarted.set(false);
-
-                                // 发送清除音频缓冲区事件
-                                System.out.println("[ASYNC] 发送清除音频缓冲区事件...");
-                                if (transcriptionClient != null) {
-                                  transcriptionClient.inputAudioBufferClear();
-                                }
-                                // 等待清除完成
-                                try {
-                                  TimeUnit.MILLISECONDS.sleep(1000);
-                                } catch (InterruptedException e) {
-                                  // 清除中断状态，继续执行
-                                  Thread.interrupted();
-                                  System.out.println("[ASYNC] Sleep interrupted, continuing...");
-                                }
-
-                                // 添加AI回复到对话历史（在清空缓存后立即添加）
-                                Message aiMessage = Message.buildAssistantAnswer(responseText);
-                                messageHistory.add(aiMessage);
-                                System.out.println("[历史记录] 添加AI回复到历史记录: " + responseText);
 
                                 // 根据语音服务选择进行语音合成
                                 if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
@@ -615,11 +651,12 @@ public class AudioChatExampleAll {
                                   sendQwenTtsFinish();
 
                                   System.out.println("[异步] Qwen TTS语音合成请求已发送");
-                                  System.out.println("[异步] 等待音频数据块...");
+                                  System.out.println("[异步] 音频数据将通过回调接收并播放，不阻塞主线程");
 
-                                  // 等待合成完成
-                                  ttsCompleteLatch.set(new CountDownLatch(1));
-                                  ttsCompleteLatch.get().await();
+                                  // 不等待合成完成，让录音线程继续运行
+                                  // TTS播放是异步的，用户说话会自动打断
+                                  // ttsCompleteLatch.set(new CountDownLatch(1));
+                                  // ttsCompleteLatch.get().await();
                                 } else {
                                   // 使用Coze TTS进行语音合成
                                   System.out.println(
@@ -780,7 +817,7 @@ public class AudioChatExampleAll {
         configBuilder.turnDetectionType("server_vad");
         configBuilder.turnDetectionThreshold(0.0f);
         configBuilder.turnDetectionSilenceDurationMs(3000);
-        System.out.println("[QWEN ASR] 使用VAD模式（自动断句），静音检测时长: 2000ms");
+        System.out.println("[QWEN ASR] 使用VAD模式（自动断句），静音检测时长: 3000ms");
       } else {
         // 手动提交模式：禁用VAD
         configBuilder.enableTurnDetection(false);
@@ -1045,8 +1082,35 @@ public class AudioChatExampleAll {
                       isSessionStarted.set(true);
                       break;
                     case "response.audio.delta":
+                      // 播放前检查：如果有新对话开始，则跳过播放
+                      if (currentChatId != null) {
+                        System.out.println("[QWEN TTS] 播放前检测到新对话(currentChatId=" + currentChatId + ")，跳过此音频块");
+                        break;
+                      }
+                      // 第一次收到音频数据时，停止所有播放、添加历史记录和清空缓存
+                      if (!historyAdded.getAndSet(true)) {
+                        // 停止所有正在播放的音频
+                        interruptAudioPlayback();
+                        System.out.println("[QWEN TTS] 播放前停止所有播放");
+                        // 重置停止标志，允许新音频播放
+                        shouldStopPlayback = false;
+                        // 清空ASR缓存
+                        if (transcriptionClient != null) {
+                          transcriptionClient.inputAudioBufferClear();
+                          System.out.println("[QWEN TTS] 播放前清空ASR缓存");
+                        }
+                        // 添加AI回复到对话历史
+                        String responseText = pendingResponseText.get();
+                        if (responseText != null && !responseText.isEmpty()) {
+                          Message aiMessage = Message.buildAssistantAnswer(responseText);
+                          messageHistory.add(aiMessage);
+                          System.out.println("[QWEN TTS] 播放前添加AI回复到历史记录: " + responseText);
+                        }
+                      }
                       String recvAudioB64 = message.get("delta").getAsString();
                       audioPlayer.write(recvAudioB64);
+                      // 开始接收音频数据时设置播放状态
+                      isResponding.set(true);
                       break;
                     case "response.done":
                       System.out.println("response done");
@@ -1055,6 +1119,7 @@ public class AudioChatExampleAll {
                     case "session.finished":
                       System.out.println("session finished");
                       isSessionStarted.set(false);
+                      isResponding.set(false);
                       ttsCompleteLatch.get().countDown();
                       break;
                     default:
@@ -1146,6 +1211,16 @@ public class AudioChatExampleAll {
     // 注意：不要调用 thread.interrupt() 或 future.cancel(true)，
     // 因为这会中断正在进行的 Coze TTS 网络请求，导致 InterruptedIOException
 
+    // 中断Qwen TTS连接 - 这会停止接收新的音频数据
+    if (qwenTtsRealtime != null) {
+      try {
+        qwenTtsRealtime.finish();
+        System.out.println("[AUDIO] 中断Qwen TTS连接");
+      } catch (Exception e) {
+        // 忽略
+      }
+    }
+
     // 中断SDK音频播放器
     if (audioPlayer != null) {
       try {
@@ -1176,6 +1251,7 @@ public class AudioChatExampleAll {
 
     // 更新状态
     isResponding.set(false);
+    isSessionStarted.set(false);
   }
 
   // 播放音频方法（用于Coze TTS）
@@ -1187,6 +1263,33 @@ public class AudioChatExampleAll {
       boolean signed,
       boolean bigEndian)
       throws Exception {
+
+    // 播放前检查：如果有新对话开始，则跳过播放
+    if (currentChatId != null) {
+      System.out.println("[COZE TTS] 播放前检测到新对话(currentChatId=" + currentChatId + ")，跳过播放");
+      return;
+    }
+
+    // 第一次播放时，停止所有播放、添加历史记录和清空缓存
+    if (!historyAdded.getAndSet(true)) {
+      // 停止所有正在播放的音频
+      interruptAudioPlayback();
+      System.out.println("[COZE TTS] 播放前停止所有播放");
+      // 重置停止标志，允许新音频播放
+      shouldStopPlayback = false;
+      // 清空ASR缓存
+      if (transcriptionClient != null) {
+        transcriptionClient.inputAudioBufferClear();
+        System.out.println("[COZE TTS] 播放前清空ASR缓存");
+      }
+      // 添加AI回复到对话历史
+      String responseText = pendingResponseText.get();
+      if (responseText != null && !responseText.isEmpty()) {
+        Message aiMessage = Message.buildAssistantAnswer(responseText);
+        messageHistory.add(aiMessage);
+        System.out.println("[COZE TTS] 播放前添加AI回复到历史记录: " + responseText);
+      }
+    }
 
     System.out.println("[AUDIO] 开始播放音频，数据大小: " + audioData.length + " 字节");
     System.out.println(
@@ -1202,6 +1305,9 @@ public class AudioChatExampleAll {
     audioLine.open(audioFormat);
     audioLine.start();
     System.out.println("[AUDIO] 音频线路已打开并开始播放");
+
+    // 保存音频到回声缓冲区用于回声消除
+    addPlaybackAudioToEchoBuffer(audioData);
 
     // 分块写入音频数据，检查停止标志
     int chunkSize = 1024 * 8; // 8KB chunks
@@ -1430,6 +1536,9 @@ public class AudioChatExampleAll {
     private void playChunk(byte[] chunk) throws IOException, InterruptedException {
       if (chunk == null || chunk.length == 0) return;
 
+      // 保存音频到回声缓冲区用于回声消除
+      addPlaybackAudioToEchoBuffer(chunk);
+
       int bytesWritten = 0;
       while (bytesWritten < chunk.length) {
         bytesWritten += line.write(chunk, bytesWritten, chunk.length - bytesWritten);
@@ -1466,5 +1575,109 @@ public class AudioChatExampleAll {
         line.close();
       }
     }
+  }
+
+  // 添加播放音频到回声缓冲区
+  private static void addPlaybackAudioToEchoBuffer(byte[] audioData) {
+    synchronized (echoLock) {
+      // 保存音频副本
+      recentPlaybackAudio.add(audioData.clone());
+      // 限制缓冲区大小
+      while (recentPlaybackAudio.size() > ECHO_BUFFER_SIZE) {
+        recentPlaybackAudio.remove(0);
+      }
+    }
+  }
+
+  // 计算音频相似度（使用归一化互相关）
+  private static double calculateAudioSimilarity(byte[] recorded, byte[] playback) {
+    if (recorded == null || playback == null || recorded.length < 4 || playback.length < 4) {
+      return 0.0;
+    }
+
+    // 将字节数组转换为样本数组
+    short[] recordedSamples = bytesToSamples(recorded);
+    short[] playbackSamples = bytesToSamples(playback);
+
+    if (recordedSamples.length == 0 || playbackSamples.length == 0) {
+      return 0.0;
+    }
+
+    // 使用较短的长度进行比较
+    int length = Math.min(recordedSamples.length, playbackSamples.length);
+
+    // 计算归一化互相关
+    double correlation = 0;
+    double recordedNorm = 0;
+    double playbackNorm = 0;
+
+    for (int i = 0; i < length; i++) {
+      correlation += recordedSamples[i] * playbackSamples[i];
+      recordedNorm += recordedSamples[i] * recordedSamples[i];
+      playbackNorm += playbackSamples[i] * playbackSamples[i];
+    }
+
+    if (recordedNorm == 0 || playbackNorm == 0) {
+      return 0.0;
+    }
+
+    // 归一化相关系数
+    return correlation / (Math.sqrt(recordedNorm) * Math.sqrt(playbackNorm));
+  }
+
+  // 将字节数组转换为short样本数组
+  private static short[] bytesToSamples(byte[] audioData) {
+    int samples = audioData.length / 2;
+    short[] result = new short[samples];
+    for (int i = 0; i < samples; i++) {
+      result[i] = (short) ((audioData[i * 2] & 0xFF) | (audioData[i * 2 + 1] << 8));
+    }
+    return result;
+  }
+
+  // 检测是否为回声
+  private static boolean isEcho(byte[] recordedAudio) {
+    // 如果没有播放过音频，不可能是回声
+    synchronized (echoLock) {
+      if (recentPlaybackAudio.isEmpty()) {
+        return false;
+      }
+
+      // 计算录制的音频能量
+      double recordedEnergy = calculateEnergy(recordedAudio);
+      if (recordedEnergy < 100) { // 能量太低，可能是噪声
+        return false;
+      }
+
+      // 与最近播放的音频块进行比对
+      double maxSimilarity = 0;
+      for (byte[] playbackAudio : recentPlaybackAudio) {
+        double similarity = calculateAudioSimilarity(recordedAudio, playbackAudio);
+        if (similarity > maxSimilarity) {
+          maxSimilarity = similarity;
+        }
+        if (similarity > ECHO_SIMILARITY_THRESHOLD) {
+          System.out.println("[AUDIO] 回声检测: 相似度=" + String.format("%.2f", similarity) + ", 判定为回声");
+          return true;
+        }
+      }
+      // 调试日志：显示最大相似度
+      System.out.println("[AUDIO] 回声检测: 最大相似度=" + String.format("%.2f", maxSimilarity) + ", 缓冲区大小=" + recentPlaybackAudio.size());
+      return false;
+    }
+  }
+
+  // 计算音频能量
+  private static double calculateEnergy(byte[] audioData) {
+    if (audioData == null || audioData.length < 2) {
+      return 0;
+    }
+    double sum = 0;
+    int samples = audioData.length / 2;
+    for (int i = 0; i < samples; i++) {
+      short sample = (short) ((audioData[i * 2] & 0xFF) | (audioData[i * 2 + 1] << 8));
+      sum += Math.abs(sample);
+    }
+    return sum / samples;
   }
 }
