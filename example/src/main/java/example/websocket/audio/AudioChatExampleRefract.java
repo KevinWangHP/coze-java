@@ -20,7 +20,10 @@ public class AudioChatExampleRefract {
   // Configuration
   private final AppConfig config = AppConfig.getInstance();
   private final String SPEECH_SERVICE = config.getSpeechService();
+  private final String ASR_PROVIDER = config.getAsrProvider();
+  private final String TTS_PROVIDER = config.getTtsProvider();
   private final String DASHSCOPE_API_KEY = config.getQwenApiKey();
+  private final String DASHSCOPE_API_BASE = config.getQwenBaseUrl();
   private final String COZE_API_TOKEN = config.getCozeApiToken();
   private final String COZE_API_BASE = config.getCozeApiBase();
   private final String BOT_ID = config.getCozeBotId();
@@ -59,6 +62,13 @@ public class AudioChatExampleRefract {
   private void initialize() throws Exception {
     System.out.println("[系统] 初始化服务...");
 
+    // 打印配置信息
+    System.out.println("[配置] ASR Provider: " + ASR_PROVIDER);
+    System.out.println("[配置] TTS Provider: " + TTS_PROVIDER);
+    System.out.println("[配置] Coze API Base: " + COZE_API_BASE);
+    System.out.println("[配置] Bot ID: " + BOT_ID);
+    System.out.println("[配置] User ID: " + USER_ID);
+
     // Initialize Echo Canceller
     echoCanceller = new EchoCanceller();
 
@@ -91,8 +101,8 @@ public class AudioChatExampleRefract {
     }
 
     // Initialize ASR Service
-    if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
-      asrService = new QwenAsrService(DASHSCOPE_API_KEY, true);
+    if ("QWEN".equalsIgnoreCase(ASR_PROVIDER)) {
+      asrService = new QwenAsrService(DASHSCOPE_API_KEY, DASHSCOPE_API_BASE, true);
     } else {
       asrService = new CozeAsrService(coze);
     }
@@ -102,8 +112,8 @@ public class AudioChatExampleRefract {
     asrService.setErrorCallback(this::onError);
 
     // Initialize TTS Service
-    if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
-      ttsService = new QwenTtsService(DASHSCOPE_API_KEY);
+    if ("QWEN".equalsIgnoreCase(TTS_PROVIDER)) {
+      ttsService = new QwenTtsService(DASHSCOPE_API_KEY, DASHSCOPE_API_BASE);
       ttsService.setAudioCallback(this::onQwenTtsAudio);
     } else {
       ttsService = new CozeTtsService(coze);
@@ -206,8 +216,8 @@ public class AudioChatExampleRefract {
   }
 
   private void onTranscription(String text) {
-    // 实时识别结果，仅用于显示和打断
-    System.out.println("[ASR] 实时识别: " + text);
+    // 实时识别结果
+    System.out.println("[" + ASR_PROVIDER + " ASR] 实时识别: " + text);
 
     if (text == null || text.trim().isEmpty()) {
       return;
@@ -219,7 +229,7 @@ public class AudioChatExampleRefract {
 
   private void onFinalTranscription(String text) {
     // 最终识别结果，发送到 Chat Bot
-    System.out.println("[ASR] 最终识别: " + text);
+    System.out.println("[" + ASR_PROVIDER + " ASR] 最终识别: " + text);
 
     if (text == null || text.trim().isEmpty()) {
       return;
@@ -270,7 +280,7 @@ public class AudioChatExampleRefract {
       content = matcher.replaceFirst("").trim();
     }
 
-    String voiceId = "QWEN".equalsIgnoreCase(SPEECH_SERVICE) ? QWEN_VOICE_ID : VOICE_ID;
+    String voiceId = "QWEN".equalsIgnoreCase(TTS_PROVIDER) ? QWEN_VOICE_ID : VOICE_ID;
 
     isResponding.set(true);
     ttsService.synthesize(content, voiceId, tone);
@@ -279,6 +289,12 @@ public class AudioChatExampleRefract {
 
   private void onCozeTtsAudio(byte[] audioData) {
     // For Coze TTS (synchronous), play directly
+    
+    // TTS 播放前清空 ASR 缓存，避免 TTS 声音被识别
+    if (asrService instanceof CozeAsrService) {
+      ((CozeAsrService) asrService).clearAudioBuffer();
+    }
+    
     audioPlayer.play(audioData);
     isResponding.set(false);
   }
@@ -288,7 +304,12 @@ public class AudioChatExampleRefract {
     // Start playback on first chunk
     if (!isResponding.get()) {
       isResponding.set(true);
-      System.out.println("[TTS] 开始播放 Qwen TTS 音频");
+      System.out.println("[TTS] 开始播放 " + TTS_PROVIDER + " TTS 音频");
+      
+      // TTS 播放前清空 ASR 缓存，避免 TTS 声音被识别
+      if (asrService instanceof CozeAsrService) {
+        ((CozeAsrService) asrService).clearAudioBuffer();
+      }
     }
     // Note: Qwen TTS audio playback is handled internally by QwenTtsRealtime
     // We just track the responding state here

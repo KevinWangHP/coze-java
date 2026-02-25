@@ -12,6 +12,7 @@ import lombok.experimental.SuperBuilder;
 @NoArgsConstructor
 @AllArgsConstructor
 @EqualsAndHashCode(callSuper = true)
+
 public class CreateSpeechReq extends BaseReq {
   @NonNull
   @JsonProperty("input")
@@ -31,4 +32,7 @@ public class CreateSpeechReq extends BaseReq {
 
   @JsonProperty("sample_rate")
   private int sampleRate;
+
+  @JsonProperty("context_texts")
+  private String contextTexts;
 }

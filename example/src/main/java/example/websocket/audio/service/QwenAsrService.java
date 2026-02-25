@@ -10,9 +10,10 @@ import com.google.gson.JsonObject;
 
 public class QwenAsrService implements AsrService {
   private static final String MODEL = "qwen3-asr-flash-realtime";
-  private static final String URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime";
+  private static final String DEFAULT_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime";
 
   private final String apiKey;
+  private final String baseUrl;
   private OmniRealtimeConversation conversation;
   private Consumer<String> transcriptionCallback;
   private Consumer<String> finalTranscriptionCallback;
@@ -23,7 +24,12 @@ public class QwenAsrService implements AsrService {
   private String lastTranscription = "";
 
   public QwenAsrService(String apiKey, boolean vadMode) {
+    this(apiKey, DEFAULT_URL, vadMode);
+  }
+
+  public QwenAsrService(String apiKey, String baseUrl, boolean vadMode) {
     this.apiKey = apiKey;
+    this.baseUrl = baseUrl != null && !baseUrl.isEmpty() ? baseUrl : DEFAULT_URL;
     this.vadMode = vadMode;
   }
 
@@ -36,7 +42,7 @@ public class QwenAsrService implements AsrService {
 
     try {
       OmniRealtimeParam param =
-          OmniRealtimeParam.builder().model(MODEL).url(URL).apikey(apiKey).build();
+          OmniRealtimeParam.builder().model(MODEL).url(baseUrl).apikey(apiKey).build();
 
       conversation =
           new OmniRealtimeConversation(

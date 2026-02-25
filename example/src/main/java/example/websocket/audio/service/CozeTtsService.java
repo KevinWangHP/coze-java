@@ -42,12 +42,12 @@ public class CozeTtsService implements TtsService {
       audioLine.start();
       stopped.set(false);
 
-      playThread = new Thread(this::playLoop, "CozeTtsPlayer");
+      playThread = new Thread(this::playLoop, "COZETtsPlayer");
       playThread.setDaemon(true);
       playThread.start();
 
     } catch (Exception e) {
-      System.err.println("[Coze TTS] 音频播放器初始化失败: " + e.getMessage());
+      System.err.println("[COZE TTS] 音频播放器初始化失败: " + e.getMessage());
     }
   }
 
@@ -93,31 +93,36 @@ public class CozeTtsService implements TtsService {
       }
 
       String content = text;
-      if (tone != null && !tone.isEmpty()) {
-        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\\[(.*?)\\]");
-        java.util.regex.Matcher matcher = pattern.matcher(text);
-        if (matcher.find()) {
-          content = matcher.replaceFirst("").trim();
-        }
-      }
+      String contextTexts = tone;
 
       String actualVoiceId = (voiceId != null && !voiceId.isEmpty()) ? voiceId : "alloy";
 
       System.out.println(
-          "[Coze TTS] 开始合成: " + content.substring(0, Math.min(30, content.length())) + "...");
+          "[COZE TTS] 开始合成: " + content.substring(0, Math.min(30, content.length())) + "...");
+      if (contextTexts != null && !contextTexts.isEmpty()) {
+        System.out.println("[COZE TTS] 语气指令: " + contextTexts);
+      }
 
-      CreateSpeechReq speechReq =
+      // 构建请求
+      CreateSpeechReq.CreateSpeechReqBuilder reqBuilder =
           CreateSpeechReq.builder()
               .input(content)
               .voiceID(actualVoiceId)
               .responseFormat(com.coze.openapi.client.audio.common.AudioFormat.WAV)
-              .sampleRate(24000)
-              .build();
+              .sampleRate(24000);
+
+      // 根据文档，使用 context_texts 参数控制语音情绪/语气
+      // 仅当 voice_id 为豆包语音合成大模型 2.0 音色时才支持该参数
+      if (contextTexts != null && !contextTexts.isEmpty()) {
+        reqBuilder.contextTexts(contextTexts);
+      }
+
+      CreateSpeechReq speechReq = reqBuilder.build();
 
       CreateSpeechResp speechResp = coze.audio().speech().create(speechReq);
       byte[] audioData = speechResp.getResponse().bytes();
 
-      System.out.println("[Coze TTS] 收到音频数据: " + audioData.length + " 字节");
+      System.out.println("[COZE TTS] 收到音频数据: " + audioData.length + " 字节");
 
       // 回调音频数据
       if (audioCallback != null) {
@@ -128,10 +133,10 @@ public class CozeTtsService implements TtsService {
       currentAudioData = audioData;
       isPlaying.set(true);
 
-      System.out.println("[Coze TTS] 开始播放音频");
+      System.out.println("[COZE TTS] 开始播放音频");
 
     } catch (Exception e) {
-      System.err.println("[Coze TTS] 合成失败: " + e.getMessage());
+      System.err.println("[COZE TTS] 合成失败: " + e.getMessage());
       isPlaying.set(false);
       if (errorCallback != null) {
         errorCallback.accept(e);
@@ -142,7 +147,7 @@ public class CozeTtsService implements TtsService {
   @Override
   public void stop() {
     if (isPlaying.get()) {
-      System.out.println("[Coze TTS] 停止播放");
+      System.out.println("[COZE TTS] 停止播放");
       isPlaying.set(false);
       currentAudioData = null;
       if (audioLine != null) {

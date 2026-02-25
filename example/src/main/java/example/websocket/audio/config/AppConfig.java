@@ -9,24 +9,25 @@ public class AppConfig {
   private static final String CONFIG_FILE = "websocket/config/application.yaml";
   private static AppConfig instance;
 
-  // Speech Service
-  private String speechService;
+  // Global Configuration
+  private String cozeToken;
+  private String qwenToken;
+  private String cozeBaseUrl;
+  private String qwenBaseUrl;
 
-  // Coze
-  private String cozeApiToken;
-  private String cozeApiBase;
-  private String cozeBotId;
-  private String cozeVoiceId;
+  // ASR Configuration
+  private String asrProvider;
 
-  // Qwen
-  private String qwenApiKey;
-  private String qwenVoiceId;
+  // Workflow Configuration
+  private String workflowProvider;
+  private String workflowCozeBotId;
+  private String workflowLlmModel;
+  private String workflowUserId;
 
-  // User
-  private String userId;
-
-  // LLM
-  private String llmModel;
+  // TTS Configuration
+  private String ttsProvider;
+  private String ttsCozeVoiceId;
+  private String ttsQwenVoiceId;
 
   private AppConfig() {
     loadConfig();
@@ -51,53 +52,53 @@ public class AppConfig {
       Yaml yaml = new Yaml();
       Map<String, Object> config = yaml.load(inputStream);
 
-      // Speech Service
-      Map<String, Object> speech = (Map<String, Object>) config.get("speech");
-      if (speech != null) {
-        speechService = resolveValue((String) speech.get("service"), "COZE");
-      }
-
-      // Coze
-      Map<String, Object> coze = (Map<String, Object>) config.get("coze");
-      if (coze != null) {
-        Map<String, Object> cozeApi = (Map<String, Object>) coze.get("api");
-        if (cozeApi != null) {
-          cozeApiToken = resolveValue((String) cozeApi.get("token"), null);
-          cozeApiBase = resolveValue((String) cozeApi.get("base_url"), null);
+      // Global Configuration
+      Map<String, Object> global = (Map<String, Object>) config.get("global");
+      if (global != null) {
+        // Tokens
+        Map<String, Object> tokens = (Map<String, Object>) global.get("tokens");
+        if (tokens != null) {
+          cozeToken = resolveValue(tokens.get("coze"), null);
+          qwenToken = resolveValue(tokens.get("qwen"), null);
         }
-        Map<String, Object> cozeBot = (Map<String, Object>) coze.get("bot");
-        if (cozeBot != null) {
-          cozeBotId = resolveValue((String) cozeBot.get("id"), null);
-        }
-        Map<String, Object> cozeVoice = (Map<String, Object>) coze.get("voice");
-        if (cozeVoice != null) {
-          cozeVoiceId = resolveValue((String) cozeVoice.get("id"), null);
+        // Base URLs
+        Map<String, Object> baseUrls = (Map<String, Object>) global.get("base_urls");
+        if (baseUrls != null) {
+          cozeBaseUrl = resolveValue(baseUrls.get("coze"), null);
+          qwenBaseUrl = resolveValue(baseUrls.get("qwen"), null);
         }
       }
 
-      // Qwen
-      Map<String, Object> qwen = (Map<String, Object>) config.get("qwen");
-      if (qwen != null) {
-        Map<String, Object> qwenApi = (Map<String, Object>) qwen.get("api");
-        if (qwenApi != null) {
-          qwenApiKey = resolveValue((String) qwenApi.get("key"), null);
-        }
-        Map<String, Object> qwenVoice = (Map<String, Object>) qwen.get("voice");
-        if (qwenVoice != null) {
-          qwenVoiceId = resolveValue((String) qwenVoice.get("id"), "Cherry");
-        }
+      // ASR Configuration
+      Map<String, Object> asr = (Map<String, Object>) config.get("asr");
+      if (asr != null) {
+        asrProvider = resolveValue(asr.get("provider"), "QWEN");
       }
 
-      // User
-      Map<String, Object> user = (Map<String, Object>) config.get("user");
-      if (user != null) {
-        userId = resolveValue((String) user.get("id"), null);
+      // Workflow Configuration
+      Map<String, Object> workflow = (Map<String, Object>) config.get("workflow");
+      if (workflow != null) {
+        workflowProvider = resolveValue(workflow.get("provider"), "COZE");
+        Map<String, Object> workflowCoze = (Map<String, Object>) workflow.get("coze");
+        if (workflowCoze != null) {
+          workflowCozeBotId = resolveValue(workflowCoze.get("bot_id"), null);
+        }
+        workflowLlmModel = resolveValue(workflow.get("llm_model"), null);
+        workflowUserId = resolveValue(workflow.get("user_id"), null);
       }
 
-      // LLM
-      Map<String, Object> llm = (Map<String, Object>) config.get("llm");
-      if (llm != null) {
-        llmModel = resolveValue((String) llm.get("model"), null);
+      // TTS Configuration
+      Map<String, Object> tts = (Map<String, Object>) config.get("tts");
+      if (tts != null) {
+        ttsProvider = resolveValue(tts.get("provider"), "QWEN");
+        Map<String, Object> ttsCoze = (Map<String, Object>) tts.get("coze");
+        if (ttsCoze != null) {
+          ttsCozeVoiceId = resolveValue(ttsCoze.get("voice_id"), null);
+        }
+        Map<String, Object> ttsQwen = (Map<String, Object>) tts.get("qwen");
+        if (ttsQwen != null) {
+          ttsQwenVoiceId = resolveValue(ttsQwen.get("voice_id"), "Cherry");
+        }
       }
 
       System.out.println("[Config] 配置文件加载成功");
@@ -108,80 +109,158 @@ public class AppConfig {
     }
   }
 
-  private String resolveValue(String value, String defaultValue) {
-    if (value == null || value.isEmpty()) {
+  private String resolveValue(Object value, String defaultValue) {
+    if (value == null) {
+      return defaultValue;
+    }
+    String strValue = value.toString();
+    if (strValue.isEmpty()) {
       return defaultValue;
     }
     // 支持 ${ENV_VAR} 或 ${ENV_VAR:default} 格式
-    if (value.startsWith("${") && value.endsWith("}")) {
-      String envExpr = value.substring(2, value.length() - 1);
+    if (strValue.startsWith("${") && strValue.endsWith("}")) {
+      String envExpr = strValue.substring(2, strValue.length() - 1);
       String[] parts = envExpr.split(":", 2);
       String envVar = parts[0];
       String envDefault = parts.length > 1 ? parts[1] : defaultValue;
       String envValue = System.getenv(envVar);
       return envValue != null ? envValue : envDefault;
     }
-    return value;
+    return strValue;
   }
 
   private void loadFromEnv() {
     System.out.println("[Config] 从环境变量加载配置");
-    speechService =
-        System.getenv("SPEECH_SERVICE") != null ? System.getenv("SPEECH_SERVICE") : "COZE";
-    qwenApiKey = System.getenv("DASHSCOPE_API_KEY");
-    cozeApiToken = System.getenv("COZE_API_TOKEN");
-    cozeApiBase = System.getenv("COZE_API_BASE");
-    cozeBotId = System.getenv("COZE_BOT_ID");
-    userId = System.getenv("USER_ID");
-    cozeVoiceId = System.getenv("COZE_VOICE_ID");
-    qwenVoiceId =
+
+    // Global Tokens
+    cozeToken = System.getenv("COZE_API_TOKEN");
+    qwenToken = System.getenv("DASHSCOPE_API_KEY");
+
+    // Global Base URLs
+    cozeBaseUrl = System.getenv("COZE_API_BASE");
+    qwenBaseUrl = System.getenv("QWEN_API_BASE");
+
+    // ASR
+    asrProvider = System.getenv("ASR_PROVIDER") != null ? System.getenv("ASR_PROVIDER") : "QWEN";
+
+    // Workflow
+    workflowProvider =
+        System.getenv("WORKFLOW_PROVIDER") != null ? System.getenv("WORKFLOW_PROVIDER") : "COZE";
+    workflowCozeBotId = System.getenv("COZE_BOT_ID");
+    workflowLlmModel = System.getenv("LLM");
+    workflowUserId = System.getenv("USER_ID");
+
+    // TTS
+    ttsProvider = System.getenv("TTS_PROVIDER") != null ? System.getenv("TTS_PROVIDER") : "QWEN";
+    ttsCozeVoiceId = System.getenv("COZE_VOICE_ID");
+    ttsQwenVoiceId =
         System.getenv("QWEN_VOICE_ID") != null ? System.getenv("QWEN_VOICE_ID") : "Cherry";
-    llmModel = System.getenv("LLM");
   }
 
-  // Getters
+  // ==================== Global Getters ====================
+  public String getCozeToken() {
+    return cozeToken;
+  }
+
+  public String getQwenToken() {
+    return qwenToken;
+  }
+
+  public String getCozeBaseUrl() {
+    return cozeBaseUrl;
+  }
+
+  public String getQwenBaseUrl() {
+    return qwenBaseUrl;
+  }
+
+  // ==================== ASR Getters ====================
+  public String getAsrProvider() {
+    return asrProvider;
+  }
+
+  // ==================== Workflow Getters ====================
+  public String getWorkflowProvider() {
+    return workflowProvider;
+  }
+
+  public String getWorkflowCozeBotId() {
+    return workflowCozeBotId;
+  }
+
+  public String getWorkflowLlmModel() {
+    return workflowLlmModel;
+  }
+
+  public String getWorkflowUserId() {
+    return workflowUserId;
+  }
+
+  // ==================== TTS Getters ====================
+  public String getTtsProvider() {
+    return ttsProvider;
+  }
+
+  public String getTtsCozeVoiceId() {
+    return ttsCozeVoiceId;
+  }
+
+  public String getTtsQwenVoiceId() {
+    return ttsQwenVoiceId;
+  }
+
+  // ==================== Legacy Getters (for backward compatibility) ====================
+  @Deprecated
   public String getSpeechService() {
-    return speechService;
+    return asrProvider;
   }
 
+  @Deprecated
   public String getCozeApiToken() {
-    return cozeApiToken;
+    return cozeToken;
   }
 
+  @Deprecated
   public String getCozeApiBase() {
-    return cozeApiBase;
+    return cozeBaseUrl;
   }
 
+  @Deprecated
   public String getCozeBotId() {
-    return cozeBotId;
+    return workflowCozeBotId;
   }
 
+  @Deprecated
   public String getCozeVoiceId() {
-    return cozeVoiceId;
+    return ttsCozeVoiceId;
   }
 
+  @Deprecated
   public String getQwenApiKey() {
-    return qwenApiKey;
+    return qwenToken;
   }
 
+  @Deprecated
   public String getQwenVoiceId() {
-    return qwenVoiceId;
+    return ttsQwenVoiceId;
   }
 
+  @Deprecated
   public String getUserId() {
-    return userId;
+    return workflowUserId;
   }
 
+  @Deprecated
   public String getLlmModel() {
-    return llmModel;
+    return workflowLlmModel;
   }
 
   public void printConfig() {
     System.out.println("[Config] 当前配置:");
-    System.out.println("  Speech Service: " + speechService);
-    System.out.println("  Coze Bot ID: " + (cozeBotId != null ? "已设置" : "未设置"));
-    System.out.println("  Qwen API Key: " + (qwenApiKey != null ? "已设置" : "未设置"));
-    System.out.println("  User ID: " + (userId != null ? userId : "未设置"));
-    System.out.println("  LLM Model: " + (llmModel != null ? llmModel : "未设置"));
+    System.out.println("  ASR Provider: " + asrProvider);
+    System.out.println("  Workflow Provider: " + workflowProvider);
+    System.out.println("  TTS Provider: " + ttsProvider);
+    System.out.println("  User ID: " + (workflowUserId != null ? workflowUserId : "未设置"));
+    System.out.println("  LLM Model: " + (workflowLlmModel != null ? workflowLlmModel : "未设置"));
   }
 }
