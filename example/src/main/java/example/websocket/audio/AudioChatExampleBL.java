@@ -249,7 +249,7 @@ public class AudioChatExampleBL {
         System.out.println("转录结果为空，不调用聊天接口");
         return;
       }
-      
+
       transcriptionSegments.add(text);
       // 调用聊天接口处理结果
       System.out.println("句子结束，准备调用聊天接口: " + text);
@@ -650,7 +650,7 @@ public class AudioChatExampleBL {
                     // 清空转录片段
                     transcriptionSegments.clear();
                     System.out.println("[CHAT] 清空本地转录缓存");
-                    
+
                     // Proceed with speech synthesis
                     System.out.println("\nBot response: " + botResponse.toString());
 
@@ -660,8 +660,6 @@ public class AudioChatExampleBL {
 
                     final String responseText = botResponse.toString();
                     // 中断所有正在进行的音频操作
-
-
 
                     // 取消之前的音频播放任务
                     if (currentAudioFuture != null && !currentAudioFuture.isDone()) {
@@ -705,9 +703,7 @@ public class AudioChatExampleBL {
 
                                 // 保存实际使用的语音ID和语气
                                 final String actualVoiceId =
-                                    (voiceID != null && !voiceID.isEmpty())
-                                        ? voiceID
-                                        : "Cherry";
+                                    (voiceID != null && !voiceID.isEmpty()) ? voiceID : "Cherry";
 
                                 // 使用百炼TTS进行语音合成
                                 System.out.println("[ASYNC] 开始使用百炼QWEN TTS生成语音...");
@@ -1045,7 +1041,7 @@ public class AudioChatExampleBL {
         // 检测是否有声音（简单的能量检测）
         boolean hasSound = false;
         for (int i = 0; i < bytesRead; i += 2) {
-          short sample = (short) ((audioBuffer[i] & 0xFF) | (audioBuffer[i+1] << 8));
+          short sample = (short) ((audioBuffer[i] & 0xFF) | (audioBuffer[i + 1] << 8));
           if (Math.abs(sample) > SILENCE_THRESHOLD) {
             hasSound = true;
             break;
@@ -1067,7 +1063,7 @@ public class AudioChatExampleBL {
           if (!transcriptionSegments.isEmpty()) {
             // 取list的最后一个值作为user message
             String lastTranscription = transcriptionSegments.get(transcriptionSegments.size() - 1);
-            
+
             // 检查转录结果是否为空
             if (lastTranscription == null || lastTranscription.trim().isEmpty()) {
               System.out.println("[TRANSCRIPTION TIMEOUT] 转录结果为空，不调用聊天接口");
@@ -1076,7 +1072,7 @@ public class AudioChatExampleBL {
               lastTranscriptUpdateTime = System.currentTimeMillis();
               return;
             }
-            
+
             System.out.println("[TRANSCRIPTION TIMEOUT] 3秒无转录更新，清除缓冲区并处理结果");
 
             // 调用聊天接口处理结果
