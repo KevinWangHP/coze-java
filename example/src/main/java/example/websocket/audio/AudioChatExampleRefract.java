@@ -39,6 +39,13 @@ public class AudioChatExampleRefract {
   private volatile long userSpeakingStartTime = 0;
   private static final long USER_SPEAKING_TIMEOUT = 5000;
 
+
+  // Audio playback control flags
+  // When any of these is true, audio playback should be blocked
+  private final AtomicBoolean isAsrProcessing = new AtomicBoolean(false);
+  private final AtomicBoolean isWorkflowProcessing = new AtomicBoolean(false);
+  private final AtomicBoolean isTtsSynthesizing = new AtomicBoolean(false);
+
   // Services
   private AudioRecorder audioRecorder;
   private AsrService asrService;
@@ -223,6 +230,9 @@ public class AudioChatExampleRefract {
       return;
     }
 
+    // 标记 ASR 正在处理
+    isAsrProcessing.set(true);
+
     // 只要有识别结果就打断播放（ASR阶段）
     interruptPlayback();
   }
@@ -232,6 +242,7 @@ public class AudioChatExampleRefract {
     System.out.println("[" + ASR_PROVIDER + " ASR] 最终识别: " + text);
 
     if (text == null || text.trim().isEmpty()) {
+      isAsrProcessing.set(false);
       return;
     }
 
@@ -243,6 +254,11 @@ public class AudioChatExampleRefract {
         () -> {
           // Bot调用阶段开始前再次打断
           interruptPlayback();
+
+          // 标记 Workflow 开始处理
+          isWorkflowProcessing.set(true);
+          // ASR 处理完成
+          isAsrProcessing.set(false);
 
           chatService.sendMessage(
               text,
@@ -259,6 +275,8 @@ public class AudioChatExampleRefract {
               response -> {
                 // onResponseComplete
                 System.out.println("[Chat] 响应完成: " + response);
+                // Workflow 处理完成
+                isWorkflowProcessing.set(false);
                 synthesizeSpeech(response);
               },
               this::onError);
@@ -282,37 +300,68 @@ public class AudioChatExampleRefract {
 
     String voiceId = "QWEN".equalsIgnoreCase(TTS_PROVIDER) ? QWEN_VOICE_ID : VOICE_ID;
 
+    // 标记 TTS 开始合成
+    isTtsSynthesizing.set(true);
     isResponding.set(true);
     ttsService.synthesize(content, voiceId, tone);
     isResponding.set(false);
+    // TTS 合成完成（音频数据会通过回调返回）
+    isTtsSynthesizing.set(false);
   }
 
   private void onCozeTtsAudio(byte[] audioData) {
-    // For Coze TTS (synchronous), play directly
-    
+    // For Coze TTS, play audio via AudioPlayer
+
     // TTS 播放前清空 ASR 缓存，避免 TTS 声音被识别
     if (asrService instanceof CozeAsrService) {
       ((CozeAsrService) asrService).clearAudioBuffer();
     }
-    
-    audioPlayer.play(audioData);
-    isResponding.set(false);
+
+    // 先停止之前的播放，避免重叠
+    if (audioPlayer != null) {
+      audioPlayer.stop();
+    }
+
+    // 检查是否可以播放音频
+    // 只有当 ASR、Workflow、TTS 都没有在进行时才允许播放
+    if (canPlayAudio()) {
+      // 播放音频
+      audioPlayer.play(audioData);
+    } else {
+      System.out.println("[TTS] 播放被阻止：ASR/Workflow/TTS 正在进行中");
+    }
+  }
+
+  /**
+   * 检查是否可以播放音频
+   * 只有当 ASR、Workflow 都没有在进行时才返回 true
+   * 注意：TTS 合成完成后的回调播放时，isTtsSynthesizing 已经为 false
+   */
+  private boolean canPlayAudio() {
+    return !isAsrProcessing.get() && !isWorkflowProcessing.get();
   }
 
   private void onQwenTtsAudio(byte[] audioData) {
-    // For Qwen TTS (asynchronous), audio comes in chunks
-    // Start playback on first chunk
-    if (!isResponding.get()) {
-      isResponding.set(true);
-      System.out.println("[TTS] 开始播放 " + TTS_PROVIDER + " TTS 音频");
-      
-      // TTS 播放前清空 ASR 缓存，避免 TTS 声音被识别
-      if (asrService instanceof CozeAsrService) {
-        ((CozeAsrService) asrService).clearAudioBuffer();
-      }
+    // For Qwen TTS, play audio via AudioPlayer
+
+    // TTS 播放前清空 ASR 缓存，避免 TTS 声音被识别
+    if (asrService instanceof CozeAsrService) {
+      ((CozeAsrService) asrService).clearAudioBuffer();
     }
-    // Note: Qwen TTS audio playback is handled internally by QwenTtsRealtime
-    // We just track the responding state here
+
+    // 先停止之前的播放，避免重叠
+    if (audioPlayer != null) {
+      audioPlayer.stop();
+    }
+
+    // 检查是否可以播放音频
+    // 只有当 ASR、Workflow 都没有在进行时才允许播放
+    if (canPlayAudio()) {
+      // 播放音频
+      audioPlayer.play(audioData);
+    } else {
+      System.out.println("[TTS] 播放被阻止：ASR/Workflow 正在进行中");
+    }
   }
 
   private void interruptPlayback() {

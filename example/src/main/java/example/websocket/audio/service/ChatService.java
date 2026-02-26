@@ -134,9 +134,9 @@ public class ChatService {
             + "...");
     Message messageWithHistory = Message.buildUserQuestionText(historyJson);
 
-    Map<String, String> customVariables = new HashMap<>();
+    Map<String, Object> parameters = new HashMap<>();
     if (model != null && !model.isEmpty()) {
-      customVariables.put("model", model);
+      parameters.put("model", model);
     }
 
     CreateChatReq chatReq =
@@ -144,7 +144,7 @@ public class ChatService {
             .botID(botId)
             .userID(userId)
             .messages(Collections.singletonList(messageWithHistory))
-            .customVariables(customVariables)
+            .parameters(parameters)
             .build();
 
     StringBuilder responseBuilder = new StringBuilder();

@@ -124,16 +124,14 @@ public class CozeTtsService implements TtsService {
 
       System.out.println("[COZE TTS] 收到音频数据: " + audioData.length + " 字节");
 
-      // 回调音频数据
+      // 回调音频数据，由外部播放器播放
       if (audioCallback != null) {
         audioCallback.accept(audioData);
       }
 
-      // 开始播放
-      currentAudioData = audioData;
-      isPlaying.set(true);
-
-      System.out.println("[COZE TTS] 开始播放音频");
+      // Note: 音频播放已移至 onCozeTtsAudio 回调中进行
+      // 避免内部播放和外部回调播放重复
+      System.out.println("[COZE TTS] 音频数据已回调，等待外部播放");
 
     } catch (Exception e) {
       System.err.println("[COZE TTS] 合成失败: " + e.getMessage());
