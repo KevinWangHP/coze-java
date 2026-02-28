@@ -94,8 +94,8 @@ public class QwenAsrService implements AsrService {
     if (vadMode) {
       configBuilder.enableTurnDetection(true);
       configBuilder.turnDetectionType("server_vad");
-      configBuilder.turnDetectionThreshold(0.0f);
-      configBuilder.turnDetectionSilenceDurationMs(3000);
+      configBuilder.turnDetectionThreshold(1.0f);
+      configBuilder.turnDetectionSilenceDurationMs(2000);
       System.out.println("[Qwen ASR] VAD 模式");
     } else {
       configBuilder.enableTurnDetection(false);

@@ -11,10 +11,6 @@ import com.alibaba.dashscope.aigc.multimodalconversation.AudioParameters;
 import com.alibaba.dashscope.aigc.multimodalconversation.MultiModalConversation;
 import com.alibaba.dashscope.aigc.multimodalconversation.MultiModalConversationParam;
 import com.alibaba.dashscope.aigc.multimodalconversation.MultiModalConversationResult;
-import com.alibaba.dashscope.exception.ApiException;
-import com.alibaba.dashscope.exception.NoApiKeyException;
-import com.alibaba.dashscope.exception.UploadFileException;
-import com.alibaba.dashscope.utils.Constants;
 
 public class QwenTtsService implements TtsService {
   private static final String MODEL = "qwen3-tts-instruct-flash";
@@ -127,27 +123,28 @@ public class QwenTtsService implements TtsService {
 
       // 根据 ref.txt 示例构建参数
       MultiModalConversation conv = new MultiModalConversation();
-      
-      MultiModalConversationParam param = MultiModalConversationParam.builder()
-          .apiKey(apiKey)
-          .model(MODEL)
-          .text(content)
-          .voice(AudioParameters.Voice.valueOf(actualVoiceId.toUpperCase()))
-          .languageType("Chinese")
-          .build();
+
+      MultiModalConversationParam param =
+          MultiModalConversationParam.builder()
+              .apiKey(apiKey)
+              .model(MODEL)
+              .text(content)
+              .voice(AudioParameters.Voice.valueOf(actualVoiceId.toUpperCase()))
+              .languageType("Chinese")
+              .build();
 
       // 如果有语气指令，需要重新构建参数（因为 SDK 可能不支持链式调用后修改）
       if (instructions != null && !instructions.isEmpty()) {
-        param = MultiModalConversationParam.builder()
-            .apiKey(apiKey)
-            .model(MODEL)
-            .text(content)
-            .voice(AudioParameters.Voice.valueOf
-              (actualVoiceId.toUpperCase()))
-            .languageType("Chinese")
-            .parameter("instructions", instructions)
-            .parameter("optimize_instructions", true)
-            .build();
+        param =
+            MultiModalConversationParam.builder()
+                .apiKey(apiKey)
+                .model(MODEL)
+                .text(content)
+                .voice(AudioParameters.Voice.valueOf(actualVoiceId.toUpperCase()))
+                .languageType("Chinese")
+                .parameter("instructions", instructions)
+                .parameter("optimize_instructions", true)
+                .build();
       }
 
       MultiModalConversationResult result = conv.call(param);

@@ -12,7 +12,6 @@ import lombok.experimental.SuperBuilder;
 @NoArgsConstructor
 @AllArgsConstructor
 @EqualsAndHashCode(callSuper = true)
-
 public class CreateSpeechReq extends BaseReq {
   @NonNull
   @JsonProperty("input")

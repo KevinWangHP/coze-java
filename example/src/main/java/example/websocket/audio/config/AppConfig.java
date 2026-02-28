@@ -18,6 +18,10 @@ public class AppConfig {
   // ASR Configuration
   private String asrProvider;
 
+  // Audio Sample Rates
+  public static final int SAMPLE_RATE_QWEN = 16000;
+  public static final int SAMPLE_RATE_COZE = 24000;
+
   // Workflow Configuration
   private String workflowProvider;
   private String workflowCozeBotId;
@@ -177,6 +181,10 @@ public class AppConfig {
   // ==================== ASR Getters ====================
   public String getAsrProvider() {
     return asrProvider;
+  }
+
+  public int getAsrSampleRate() {
+    return "QWEN".equalsIgnoreCase(asrProvider) ? SAMPLE_RATE_QWEN : SAMPLE_RATE_COZE;
   }
 
   // ==================== Workflow Getters ====================

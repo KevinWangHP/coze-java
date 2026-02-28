@@ -39,7 +39,6 @@ public class AudioChatExampleRefract {
   private volatile long userSpeakingStartTime = 0;
   private static final long USER_SPEAKING_TIMEOUT = 5000;
 
-
   // Audio playback control flags
   // When any of these is true, audio playback should be blocked
   private final AtomicBoolean isAsrProcessing = new AtomicBoolean(false);
@@ -76,8 +75,13 @@ public class AudioChatExampleRefract {
     System.out.println("[配置] Bot ID: " + BOT_ID);
     System.out.println("[配置] User ID: " + USER_ID);
 
-    // Initialize Echo Canceller
+    // Get sample rate based on ASR provider
+    int sampleRate = config.getAsrSampleRate();
+    System.out.println("[音频] 麦克风采样率设置为: " + sampleRate + "Hz (ASR: " + ASR_PROVIDER + ")");
+
+    // Initialize Echo Canceller with sample rate
     echoCanceller = new EchoCanceller();
+    echoCanceller.setSampleRate(sampleRate);
 
     // Initialize Audio Player
     audioPlayer = new AudioPlayer(echoCanceller);
@@ -100,10 +104,13 @@ public class AudioChatExampleRefract {
             .build();
 
     // Initialize Chat Service
+    System.out.println("[ChatService] 初始化, SPEECH_SERVICE=" + SPEECH_SERVICE);
     chatService = new ChatService(coze, BOT_ID, USER_ID, MODEL);
     if ("QWEN".equalsIgnoreCase(SPEECH_SERVICE)) {
+      System.out.println("[ChatService] 使用QWEN模式，创建自定义会话ID");
       chatService.createConversation(UUID.randomUUID().toString());
     } else {
+      System.out.println("[ChatService] 使用COZE模式，调用API创建会话");
       chatService.createConversation();
     }
 
@@ -129,8 +136,8 @@ public class AudioChatExampleRefract {
     ttsService.initialize();
     ttsService.setErrorCallback(this::onError);
 
-    // Initialize Audio Recorder
-    audioRecorder = new AudioRecorder();
+    // Initialize Audio Recorder with sample rate based on ASR provider
+    audioRecorder = new AudioRecorder(sampleRate);
 
     // Setup shutdown hook
     Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown));
@@ -199,14 +206,6 @@ public class AudioChatExampleRefract {
     boolean isEcho = false;
     if (!userSpeaking.get()) {
       isEcho = echoCanceller.isEcho(audioData.getData());
-    }
-
-    // Interrupt TTS if user speaks
-    if (audioData.hasSound() && isResponding.get()) {
-      System.out.println("[系统] 检测到用户说话，打断播放");
-      interruptPlayback();
-      userSpeaking.set(true);
-      userSpeakingStartTime = System.currentTimeMillis();
     }
 
     // Send to ASR (skip echo)
@@ -332,11 +331,7 @@ public class AudioChatExampleRefract {
     }
   }
 
-  /**
-   * 检查是否可以播放音频
-   * 只有当 ASR、Workflow 都没有在进行时才返回 true
-   * 注意：TTS 合成完成后的回调播放时，isTtsSynthesizing 已经为 false
-   */
+  /** 检查是否可以播放音频 只有当 ASR、Workflow 都没有在进行时才返回 true 注意：TTS 合成完成后的回调播放时，isTtsSynthesizing 已经为 false */
   private boolean canPlayAudio() {
     return !isAsrProcessing.get() && !isWorkflowProcessing.get();
   }

@@ -13,6 +13,8 @@ public interface TtsService {
 
   boolean isReady();
 
+  boolean isPlaying();
+
   void setAudioCallback(Consumer<byte[]> callback);
 
   void setErrorCallback(Consumer<Exception> callback);

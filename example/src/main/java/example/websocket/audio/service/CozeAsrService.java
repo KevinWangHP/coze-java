@@ -18,7 +18,7 @@ import com.coze.openapi.service.service.websocket.audio.transcriptions.Websocket
 public class CozeAsrService implements AsrService {
   private static final int SAMPLE_RATE = 24000;
   private static final int CHANNELS = 1;
-  private static final long SILENCE_TIMEOUT_MS = 2000; // 2秒无更新则认为识别完成
+  private static final long SILENCE_TIMEOUT_MS = 1000; // 2秒无更新则认为识别完成
 
   private final CozeAPI coze;
   private WebsocketsAudioTranscriptionsClient transcriptionClient;
@@ -102,7 +102,8 @@ public class CozeAsrService implements AsrService {
   private void startSilenceTimer() {
     cancelSilenceTimer();
     hasFinalResult = false;
-    silenceTimer = scheduler.schedule(this::onSilenceTimeout, SILENCE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    silenceTimer =
+        scheduler.schedule(this::onSilenceTimeout, SILENCE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
   }
 
   private void cancelSilenceTimer() {
@@ -142,9 +143,7 @@ public class CozeAsrService implements AsrService {
     this.errorCallback = callback;
   }
 
-  /**
-   * 清空 ASR 音频缓存，用于 TTS 播放前避免 TTS 声音被识别
-   */
+  /** 清空 ASR 音频缓存，用于 TTS 播放前避免 TTS 声音被识别 */
   public void clearAudioBuffer() {
     System.out.println("[COZE ASR] 清空音频缓存");
     // 向 Coze WebSocket 服务器发送清空音频缓存的请求
@@ -172,20 +171,20 @@ public class CozeAsrService implements AsrService {
     public void onTranscriptionsMessageUpdate(
         WebsocketsAudioTranscriptionsClient client, TranscriptionsMessageUpdateEvent event) {
       String text = event.getData().getContent();
-      
+
       // 如果已经有最终结果，重置状态以处理新的语音输入
       if (hasFinalResult) {
         hasFinalResult = false;
         lastText = "";
       }
-      
+
       lastText = text;
-      
+
       // 实时识别结果
       if (transcriptionCallback != null) {
         transcriptionCallback.accept(text);
       }
-      
+
       // 每次收到更新都重新启动静默定时器
       startSilenceTimer();
     }

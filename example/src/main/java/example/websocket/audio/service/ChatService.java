@@ -37,12 +37,13 @@ public class ChatService {
   }
 
   public void createConversation() throws Exception {
+    System.out.println("[ChatService] 开始创建会话, BotID: " + botId);
     CreateConversationReq req = new CreateConversationReq();
     req.setBotID(botId);
 
     CreateConversationResp resp = coze.conversations().create(req);
     conversationId = resp.getConversation().getId();
-    System.out.println("[ChatService] 会话创建: " + conversationId);
+    System.out.println("[ChatService] 会话创建成功, ConversationID: " + conversationId);
   }
 
   public void createConversation(String customConversationId) {
@@ -137,6 +138,9 @@ public class ChatService {
     Map<String, Object> parameters = new HashMap<>();
     if (model != null && !model.isEmpty()) {
       parameters.put("model", model);
+      System.out.println("[ChatService] 使用模型: " + model);
+    } else {
+      System.out.println("[ChatService] 使用默认模型");
     }
 
     CreateChatReq chatReq =
@@ -162,7 +166,8 @@ public class ChatService {
                         responseBuilder,
                         onResponseStart,
                         onResponseDelta,
-                        onResponseComplete),
+                        onResponseComplete,
+                        onError),
                 throwable -> {
                   isWaitingForResponse = false;
                   handleError(throwable, onError);
@@ -177,7 +182,8 @@ public class ChatService {
       StringBuilder responseBuilder,
       Consumer<String> onResponseStart,
       Consumer<String> onResponseDelta,
-      Consumer<String> onResponseComplete) {
+      Consumer<String> onResponseComplete,
+      Consumer<Exception> onError) {
     String eventValue = event.getEvent().getValue();
 
     if (ChatEventType.CONVERSATION_CHAT_CREATED.getValue().equals(eventValue)) {
@@ -209,6 +215,17 @@ public class ChatService {
 
       if (onResponseComplete != null) {
         onResponseComplete.accept(response);
+      }
+    } else if ("conversation.chat.failed".equals(eventValue)) {
+      isWaitingForResponse = false;
+      String errorMsg = "未知错误";
+      if (event.getMessage() != null && event.getMessage().getContent() != null) {
+        errorMsg = event.getMessage().getContent();
+      }
+      System.err.println("[ChatService] Chat 失败: " + errorMsg);
+      System.err.println("[ChatService] 失败事件详情: " + event);
+      if (onError != null) {
+        onError.accept(new RuntimeException("Chat failed: " + errorMsg));
       }
     }
   }

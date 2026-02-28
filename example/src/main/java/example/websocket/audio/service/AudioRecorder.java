@@ -8,24 +8,31 @@ import java.util.function.Consumer;
 import javax.sound.sampled.*;
 
 public class AudioRecorder {
-  private static final int SAMPLE_RATE = 24000;
   private static final int CHANNELS = 1;
   private static final int SAMPLE_SIZE_IN_BITS = 16;
   private static final boolean BIG_ENDIAN = false;
-  private static final int SILENCE_THRESHOLD = 1000;
+  private static final int SILENCE_THRESHOLD = 100;
   private static final int BUFFER_SIZE = 1024;
 
+  private final int sampleRate;
   private final javax.sound.sampled.AudioFormat audioFormat;
+  private final int silenceThreshold;
   private TargetDataLine microphone;
   private volatile boolean isRecording = false;
   private Thread recordThread;
   private Consumer<AudioData> audioDataConsumer;
   private Consumer<Exception> errorConsumer;
 
-  public AudioRecorder() {
+  public AudioRecorder(int sampleRate) {
+    this(sampleRate, SILENCE_THRESHOLD);
+  }
+
+  public AudioRecorder(int sampleRate, int silenceThreshold) {
+    this.sampleRate = sampleRate;
     this.audioFormat =
         new javax.sound.sampled.AudioFormat(
-            SAMPLE_RATE, SAMPLE_SIZE_IN_BITS, CHANNELS, true, BIG_ENDIAN);
+            sampleRate, SAMPLE_SIZE_IN_BITS, CHANNELS, true, BIG_ENDIAN);
+    this.silenceThreshold = silenceThreshold;
   }
 
   public List<AudioDevice> getAudioDevices() {
@@ -148,14 +155,25 @@ public class AudioRecorder {
       if (Math.abs(sample) > maxSample) {
         maxSample = (short) Math.abs(sample);
       }
-      if (Math.abs(sample) > SILENCE_THRESHOLD) {
+      if (Math.abs(sample) > silenceThreshold) {
         hasSound = true;
       }
     }
 
     double avgEnergy = count > 0 ? sum / count : 0;
     byte[] data = new byte[bytesRead];
-    System.arraycopy(buffer, 0, data, 0, bytesRead);
+    
+    // 如果声音太小（平均能量低于静音阈值的一半），将音频归零
+    if (avgEnergy < silenceThreshold * 0.5) {
+      // 全零数据
+      for (int i = 0; i < bytesRead; i++) {
+        data[i] = 0;
+      }
+      hasSound = false;
+    } else {
+      // 正常音频数据
+      System.arraycopy(buffer, 0, data, 0, bytesRead);
+    }
 
     return new AudioData(data, hasSound, avgEnergy, maxSample);
   }
