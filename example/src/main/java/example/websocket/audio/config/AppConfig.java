@@ -30,6 +30,7 @@ public class AppConfig {
 
   // TTS Configuration
   private String ttsProvider;
+  private boolean ttsStreaming;  // true = WebSocket streaming, false = HTTP non-streaming
   private String ttsCozeVoiceId;
   private String ttsQwenVoiceId;
 
@@ -95,6 +96,9 @@ public class AppConfig {
       Map<String, Object> tts = (Map<String, Object>) config.get("tts");
       if (tts != null) {
         ttsProvider = resolveValue(tts.get("provider"), "QWEN");
+        // Streaming mode: default false for backward compatibility
+        Object streamingValue = tts.get("streaming");
+        ttsStreaming = streamingValue != null && Boolean.parseBoolean(streamingValue.toString());
         Map<String, Object> ttsCoze = (Map<String, Object>) tts.get("coze");
         if (ttsCoze != null) {
           ttsCozeVoiceId = resolveValue(ttsCoze.get("voice_id"), null);
@@ -156,6 +160,8 @@ public class AppConfig {
 
     // TTS
     ttsProvider = System.getenv("TTS_PROVIDER") != null ? System.getenv("TTS_PROVIDER") : "QWEN";
+    String ttsStreamingEnv = System.getenv("TTS_STREAMING");
+    ttsStreaming = ttsStreamingEnv != null && ttsStreamingEnv.equalsIgnoreCase("true");
     ttsCozeVoiceId = System.getenv("COZE_VOICE_ID");
     ttsQwenVoiceId =
         System.getenv("QWEN_VOICE_ID") != null ? System.getenv("QWEN_VOICE_ID") : "Cherry";
@@ -207,6 +213,10 @@ public class AppConfig {
   // ==================== TTS Getters ====================
   public String getTtsProvider() {
     return ttsProvider;
+  }
+
+  public boolean isTtsStreaming() {
+    return ttsStreaming;
   }
 
   public String getTtsCozeVoiceId() {
@@ -268,6 +278,7 @@ public class AppConfig {
     System.out.println("  ASR Provider: " + asrProvider);
     System.out.println("  Workflow Provider: " + workflowProvider);
     System.out.println("  TTS Provider: " + ttsProvider);
+    System.out.println("  TTS Streaming: " + ttsStreaming);
     System.out.println("  User ID: " + (workflowUserId != null ? workflowUserId : "未设置"));
     System.out.println("  LLM Model: " + (workflowLlmModel != null ? workflowLlmModel : "未设置"));
   }

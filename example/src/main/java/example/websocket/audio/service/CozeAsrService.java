@@ -18,7 +18,7 @@ import com.coze.openapi.service.service.websocket.audio.transcriptions.Websocket
 public class CozeAsrService implements AsrService {
   private static final int SAMPLE_RATE = 24000;
   private static final int CHANNELS = 1;
-  private static final long SILENCE_TIMEOUT_MS = 1000; // 2秒无更新则认为识别完成
+  private static final long SILENCE_TIMEOUT_MS = 500; // 2秒无更新则认为识别完成
 
   private final CozeAPI coze;
   private WebsocketsAudioTranscriptionsClient transcriptionClient;
@@ -38,6 +38,7 @@ public class CozeAsrService implements AsrService {
   @Override
   public void initialize() {
     try {
+      System.out.println("[COZE ASR] 开始初始化...");
       transcriptionClient =
           coze.websockets()
               .audio()
@@ -63,6 +64,7 @@ public class CozeAsrService implements AsrService {
     } catch (Exception e) {
       isReady = false;
       System.err.println("[COZE ASR] 初始化失败: " + e.getMessage());
+      e.printStackTrace();
       if (errorCallback != null) {
         errorCallback.accept(e);
       }

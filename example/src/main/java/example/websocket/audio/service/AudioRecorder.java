@@ -11,7 +11,7 @@ public class AudioRecorder {
   private static final int CHANNELS = 1;
   private static final int SAMPLE_SIZE_IN_BITS = 16;
   private static final boolean BIG_ENDIAN = false;
-  private static final int SILENCE_THRESHOLD = 100;
+  private static final int SILENCE_THRESHOLD = 50;
   private static final int BUFFER_SIZE = 1024;
 
   private final int sampleRate;
