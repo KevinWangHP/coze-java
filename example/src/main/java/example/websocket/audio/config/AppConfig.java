@@ -30,7 +30,7 @@ public class AppConfig {
 
   // TTS Configuration
   private String ttsProvider;
-  private boolean ttsStreaming;  // true = WebSocket streaming, false = HTTP non-streaming
+  private boolean ttsStreaming; // true = WebSocket streaming, false = HTTP non-streaming
   private String ttsCozeVoiceId;
   private String ttsQwenVoiceId;
 

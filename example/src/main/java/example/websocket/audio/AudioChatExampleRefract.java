@@ -381,24 +381,25 @@ public class AudioChatExampleRefract {
       isTtsSynthesizing.set(false);
     } else {
       // 流式TTS：在后台线程中等待播放完成并记录统计
-      executorService.submit(() -> {
-        try {
-          // 等待最多30秒，直到流式TTS完成
-          int waitCount = 0;
-          while (ttsService.isPlaying() && waitCount < 300) {
-            Thread.sleep(100);
-            waitCount++;
-          }
-          // 重置状态
-          isResponding.set(false);
-          isTtsSynthesizing.set(false);
+      executorService.submit(
+          () -> {
+            try {
+              // 等待最多30秒，直到流式TTS完成
+              int waitCount = 0;
+              while (ttsService.isPlaying() && waitCount < 300) {
+                Thread.sleep(100);
+                waitCount++;
+              }
+              // 重置状态
+              isResponding.set(false);
+              isTtsSynthesizing.set(false);
 
-          // 重置会话开始时间，准备下一次会话
-          sessionStartTime = 0;
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-        }
-      });
+              // 重置会话开始时间，准备下一次会话
+              sessionStartTime = 0;
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+            }
+          });
     }
   }
 
@@ -481,10 +482,7 @@ public class AudioChatExampleRefract {
     sessionStartTime = 0;
   }
 
-  /**
-   * 流式TTS音频回调 - 用于性能统计
-   * 流式TTS内部自己处理播放，这里只记录性能指标
-   */
+  /** 流式TTS音频回调 - 用于性能统计 流式TTS内部自己处理播放，这里只记录性能指标 */
   private void onStreamingTtsAudio(byte[] audioData) {
     // 流式TTS内部自己处理播放，这里只用于性能统计
 

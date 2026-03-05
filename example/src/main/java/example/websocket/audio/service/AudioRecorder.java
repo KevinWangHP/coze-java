@@ -162,7 +162,7 @@ public class AudioRecorder {
 
     double avgEnergy = count > 0 ? sum / count : 0;
     byte[] data = new byte[bytesRead];
-    
+
     // 如果声音太小（平均能量低于静音阈值的一半），将音频归零
     if (avgEnergy < silenceThreshold * 0.5) {
       // 全零数据

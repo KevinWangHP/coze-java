@@ -17,7 +17,8 @@ public class EchoCanceller {
   // 时域相似度权重
   private static final double TEMPORAL_WEIGHT = 0.4;
 
-  private final ConcurrentLinkedQueue<TimestampedAudio> playbackBuffer = new ConcurrentLinkedQueue<>();
+  private final ConcurrentLinkedQueue<TimestampedAudio> playbackBuffer =
+      new ConcurrentLinkedQueue<>();
   private final AtomicLong lastPlaybackTime = new AtomicLong(0);
   private volatile int sampleRate = 16000;
 
