@@ -59,10 +59,9 @@ public class CozeStreamingTtsService implements TtsService {
   public void initialize() {
     try {
       System.out.println("[COZE Streaming TTS] 开始初始化...");
-      // 只初始化音频播放器，WebSocket连接在合成时创建
-      initAudioPlayer();
+      // Backend不需要初始化音频播放器，只通过callback转发音频给客户端
       isReady = true;
-      System.out.println("[COZE Streaming TTS] 初始化完成，Voice ID: " + voiceId);
+      System.out.println("[COZE Streaming TTS] 初始化完成，Voice ID: " + voiceId + " (仅转发模式)");
     } catch (Exception e) {
       isReady = false;
       System.err.println("[COZE Streaming TTS] 初始化失败: " + e.getMessage());
@@ -70,26 +69,6 @@ public class CozeStreamingTtsService implements TtsService {
       if (errorCallback != null) {
         errorCallback.accept(e);
       }
-    }
-  }
-
-  private void initAudioPlayer() {
-    try {
-      AudioFormat format = new AudioFormat(SAMPLE_RATE, 16, 1, true, false);
-      DataLine.Info info = new DataLine.Info(SourceDataLine.class, format);
-      audioLine = (SourceDataLine) AudioSystem.getLine(info);
-      int bufferSize = SAMPLE_RATE * 2 * 2; // 2秒缓冲
-      audioLine.open(format, bufferSize);
-      audioLine.start();
-
-      stopped.set(false);
-      playThread = new Thread(this::playLoop, "StreamingTtsPlayer");
-      playThread.setDaemon(true);
-      playThread.start();
-
-    } catch (Exception e) {
-      System.err.println("[COZE Streaming TTS] 音频播放器初始化失败: " + e.getMessage());
-      throw new RuntimeException(e);
     }
   }
 
@@ -156,8 +135,17 @@ public class CozeStreamingTtsService implements TtsService {
       return;
     }
 
+    System.out.println("[COZE Streaming TTS] synthesize被调用，当前speechClient=" + (speechClient != null));
+
     // 停止之前的播放和连接
     stop();
+
+    // 等待旧连接完全关闭，确保可以重新创建
+    try {
+      Thread.sleep(500);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
 
     String content = text.trim();
     System.out.println(
@@ -236,38 +224,30 @@ public class CozeStreamingTtsService implements TtsService {
     audioBuffer.offer(audioData);
     int totalBytes = bufferedBytes.addAndGet(audioData.length);
 
-    // 回调音频数据给外部（用于性能统计等）
+    // 回调音频数据给外部（转发给客户端）
     if (audioCallback != null) {
       audioCallback.accept(audioData);
     }
 
-    // 当缓存达到阈值时开始播放
-    int thresholdBytes = BUFFER_THRESHOLD_MS * BYTES_PER_MS;
-    if (!isPlaying.get() && totalBytes >= thresholdBytes && isSynthesizing.get()) {
-      playbackStartTime = System.currentTimeMillis();
-      long timeToPlayback = playbackStartTime - synthesisStartTime;
-      System.out.println(
-          "[COZE Streaming TTS] 缓存达到阈值，开始播放 ("
-              + totalBytes
-              + " bytes)，播放时延: "
-              + timeToPlayback
-              + " ms");
-      isPlaying.set(true);
+    // Backend不再进行内部播放，只转发音频
+    // 打印首包时延信息
+    if (firstAudioReceivedTime == 0) {
+      firstAudioReceivedTime = System.currentTimeMillis();
+      long timeToFirstAudio = firstAudioReceivedTime - synthesisStartTime;
+      System.out.println("[COZE Streaming TTS] 首包时延: " + timeToFirstAudio + " ms (仅转发给客户端)");
     }
   }
 
   @Override
   public void stop() {
-    if (isPlaying.get() || isSynthesizing.get()) {
-      System.out.println("[COZE Streaming TTS] 停止播放/合成");
-      // 设置停止请求标志，让播放循环处理停止逻辑
-      stopRequested.set(true);
+    if (isSynthesizing.get()) {
+      System.out.println("[COZE Streaming TTS] 停止合成");
       isSynthesizing.set(false);
+      isPlaying.set(false);
 
-      // 立即清空音频行，停止当前播放
-      if (audioLine != null) {
-        audioLine.flush();
-      }
+      // 清空缓存
+      audioBuffer.clear();
+      bufferedBytes.set(0);
 
       // 关闭WebSocket连接
       if (speechClient != null) {
@@ -277,6 +257,13 @@ public class CozeStreamingTtsService implements TtsService {
           // ignore
         }
         speechClient = null;
+      }
+
+      // 等待一下确保连接关闭
+      try {
+        Thread.sleep(500);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
       }
 
       // 重置时间戳
@@ -289,23 +276,7 @@ public class CozeStreamingTtsService implements TtsService {
   @Override
   public void close() {
     System.out.println("[COZE Streaming TTS] 关闭服务...");
-    stopped.set(true);
     stop();
-
-    if (playThread != null) {
-      playThread.interrupt();
-      try {
-        playThread.join(1000);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-      }
-    }
-
-    if (audioLine != null) {
-      audioLine.close();
-      audioLine = null;
-    }
-
     isReady = false;
   }
 
@@ -351,41 +322,6 @@ public class CozeStreamingTtsService implements TtsService {
         WebsocketsAudioSpeechClient client, SpeechAudioCompletedEvent event) {
       System.out.println("[COZE Streaming TTS] 音频合成完成");
       isSynthesizing.set(false);
-
-      // 如果缓存中还有数据，继续播放直到完成
-      if (!audioBuffer.isEmpty() && !isPlaying.get()) {
-        isPlaying.set(true);
-      }
-
-      // 启动一个后台线程等待播放完成
-      new Thread(
-              () -> {
-                int waitCount = 0;
-                // 最多等待30秒
-                while ((isPlaying.get() || !audioBuffer.isEmpty()) && waitCount < 300) {
-                  try {
-                    Thread.sleep(100);
-                    waitCount++;
-                  } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                  }
-                }
-                // 确保播放状态被重置
-                isPlaying.set(false);
-                // 关闭WebSocket连接
-                if (speechClient != null) {
-                  try {
-                    speechClient.close();
-                  } catch (Exception e) {
-                    // ignore
-                  }
-                  speechClient = null;
-                }
-                System.out.println("[COZE Streaming TTS] 播放完成，可以接收新输入");
-              },
-              "TtsCompletionMonitor")
-          .start();
     }
 
     @Override

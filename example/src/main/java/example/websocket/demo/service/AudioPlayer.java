@@ -1,6 +1,5 @@
 package example.websocket.demo.service;
 
-import java.util.Base64;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -9,18 +8,15 @@ import javax.sound.sampled.*;
 
 public class AudioPlayer {
   private static final int SAMPLE_RATE = 24000;
-  private static final int PRE_BUFFER_MS = 200;
   private static final int CHUNK_SIZE = 1024 * 8;
+  private static final int PRE_BUFFER_MS = 400;  // 预缓冲400ms
 
   private SourceDataLine audioLine;
   private final EchoCanceller echoCanceller;
   private volatile boolean shouldStop = false;
   private final AtomicBoolean isPlaying = new AtomicBoolean(false);
 
-  // Realtime PCM Player components
-  private Queue<String> b64AudioBuffer;
   private Queue<byte[]> rawAudioBuffer;
-  private Thread decoderThread;
   private Thread playerThread;
   private final AtomicBoolean stopped = new AtomicBoolean(false);
   private final AtomicBoolean preBufferReady = new AtomicBoolean(false);
@@ -45,7 +41,6 @@ public class AudioPlayer {
       audioLine.open(format);
       audioLine.start();
 
-      // Add to echo buffer
       if (echoCanceller != null) {
         echoCanceller.addPlaybackAudio(audioData);
       }
@@ -70,7 +65,6 @@ public class AudioPlayer {
   }
 
   public void startRealtimePlayback() {
-    b64AudioBuffer = new ConcurrentLinkedQueue<>();
     rawAudioBuffer = new ConcurrentLinkedQueue<>();
     stopped.set(false);
     preBufferReady.set(false);
@@ -84,9 +78,7 @@ public class AudioPlayer {
       audioLine.open(format, bufferSize);
       audioLine.start();
 
-      decoderThread = new Thread(this::decodeLoop, "AudioDecoder");
       playerThread = new Thread(this::playLoop, "AudioPlayer");
-      decoderThread.start();
       playerThread.start();
 
     } catch (Exception e) {
@@ -94,30 +86,34 @@ public class AudioPlayer {
     }
   }
 
-  private void decodeLoop() {
-    while (!stopped.get()) {
-      String b64Audio = b64AudioBuffer.poll();
-      if (b64Audio != null) {
-        byte[] rawAudio = Base64.getDecoder().decode(b64Audio);
-        rawAudioBuffer.add(rawAudio);
-        bufferedDataSize += rawAudio.length;
-      } else {
-        try {
-          Thread.sleep(5);
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-        }
-      }
+  public void writeRealtimeAudioRaw(byte[] pcmData) {
+    if (pcmData == null || pcmData.length == 0 || stopped.get()) {
+      return;
     }
+
+    rawAudioBuffer.add(pcmData);
+    bufferedDataSize += pcmData.length;
+  }
+
+  public void cancelRealtimePlayback() {
+    if (rawAudioBuffer != null) {
+      rawAudioBuffer.clear();
+    }
+    bufferedDataSize = 0;
+    preBufferReady.set(false);
+  }
+
+  public void resumeRealtimePlayback() {
+    preBufferReady.set(false);
   }
 
   private void playLoop() {
     while (!stopped.get()) {
+      // 等待预缓冲完成
       if (!preBufferReady.get()) {
         int preBufferBytes = PRE_BUFFER_MS * SAMPLE_RATE * 2 / 1000;
         if (bufferedDataSize >= preBufferBytes) {
           preBufferReady.set(true);
-          System.out.println("[AudioPlayer] 预缓冲完成");
         } else {
           try {
             Thread.sleep(10);
@@ -131,7 +127,15 @@ public class AudioPlayer {
       byte[] rawAudio = rawAudioBuffer.poll();
       if (rawAudio != null) {
         bufferedDataSize -= rawAudio.length;
-        playChunk(rawAudio);
+
+        if (echoCanceller != null) {
+          echoCanceller.addPlaybackAudio(rawAudio);
+        }
+
+        int bytesWritten = 0;
+        while (bytesWritten < rawAudio.length) {
+          bytesWritten += audioLine.write(rawAudio, bytesWritten, rawAudio.length - bytesWritten);
+        }
         isPlaying.set(true);
       } else {
         try {
@@ -140,25 +144,6 @@ public class AudioPlayer {
           Thread.currentThread().interrupt();
         }
       }
-    }
-  }
-
-  private void playChunk(byte[] chunk) {
-    if (chunk == null || chunk.length == 0) return;
-
-    if (echoCanceller != null) {
-      echoCanceller.addPlaybackAudio(chunk);
-    }
-
-    int bytesWritten = 0;
-    while (bytesWritten < chunk.length) {
-      bytesWritten += audioLine.write(chunk, bytesWritten, chunk.length - bytesWritten);
-    }
-  }
-
-  public void writeRealtimeAudio(String b64Audio) {
-    if (b64AudioBuffer != null) {
-      b64AudioBuffer.add(b64Audio);
     }
   }
 
@@ -172,7 +157,6 @@ public class AudioPlayer {
         }
         audioLine.flush();
       } catch (Exception e) {
-        // ignore
       }
     }
 
@@ -180,28 +164,9 @@ public class AudioPlayer {
     isPlaying.set(false);
   }
 
-  public void cancelRealtimePlayback() {
-    if (b64AudioBuffer != null) {
-      b64AudioBuffer.clear();
-    }
-    if (rawAudioBuffer != null) {
-      rawAudioBuffer.clear();
-    }
-    bufferedDataSize = 0;
-    preBufferReady.set(false);
-  }
-
   public void close() {
     stop();
-    cancelRealtimePlayback();
 
-    if (decoderThread != null) {
-      try {
-        decoderThread.join(500);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-      }
-    }
     if (playerThread != null) {
       try {
         playerThread.join(500);
@@ -216,11 +181,8 @@ public class AudioPlayer {
   private void closeLine() {
     if (audioLine != null) {
       try {
-        if (audioLine.isOpen()) {
-          audioLine.close();
-        }
+        audioLine.close();
       } catch (Exception e) {
-        // ignore
       }
       audioLine = null;
     }
